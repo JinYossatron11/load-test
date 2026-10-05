@@ -1,0 +1,245 @@
+# บทที่ 5 — Capacity test ด้วยสเปก production
+
+เป้าหมาย: หาว่า **1 task** (0.25 vCPU / 1 GB) รับ check-in ได้กี่ TPS แล้วยืนยันว่า **6 tasks** รับได้เท่าไร
+
+```
+แผนการทดสอบ
+5.1 จำกัดทรัพยากรเท่า prod  →  5.2 Baseline 1 task  →  5.3 Breakpoint 1 task
+→  5.4 ยืนยันที่ Max TPS  →  5.5 Scale เป็น 6 tasks  →  5.6 Spike + Soak
+```
+
+---
+
+## 5.1 จำกัด CPU / RAM ให้เท่า production
+
+Production (ECS): `cpu: 256` = **0.25 vCPU**, `memory: 1024` = **1 GB**, จำนวน **6 tasks**
+
+แก้ service `app` ใน `docker-compose.yml`:
+
+```yaml
+  app:
+    image: <checkin-app-image>
+    cpus: "0.25"        # = 256 CPU units
+    mem_limit: 1g       # = 1024 MB, เกินแล้วโดน OOM kill เหมือน ECS
+    memswap_limit: 1g   # ห้ามใช้ swap (ECS Fargate ไม่มี swap)
+    environment:
+      # ใช้ env / runtime config ชุดเดียวกับ production ทุกตัว
+      # สำคัญ: runtime ต้องรู้ว่าตัวเองมี CPU น้อย
+      # - Java:  JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=1 -XX:MaxRAMPercentage=75
+      # - Node:  NODE_OPTIONS=--max-old-space-size=768
+      # - Go:    GOMAXPROCS=1
+      # - Python (gunicorn/uvicorn): จำนวน worker เท่า prod
+      # - DB connection pool size เท่า prod
+```
+
+ตรวจว่าจำกัดได้จริง:
+
+```bash
+docker compose up -d app
+docker stats   # คอลัมน์ CPU % ของ app ต้องไม่เกิน ~25%, MEM LIMIT = 1GiB
+```
+
+### ⚠️ ข้อควรระวังเรื่องความต่างของ CPU (ต้องอ่าน)
+
+0.25 vCPU บน Mac (Apple Silicon) **เร็วกว่า** 0.25 vCPU บน AWS Fargate มาก เพราะ 1 core ของ Mac แรงกว่า 1 vCPU ของ Fargate (ซึ่งเป็นแค่ 1 hyperthread)
+→ TPS ที่วัดได้บน local จะ **สูงเกินจริง** ต้องปรับด้วย **calibration factor** (วิธีคิดอยู่ใน [บทที่ 6.5](06-tps-calculation.md#65-calibration--แปลงผล-local-เป็น-production))
+
+ความต่างอื่นที่ทำให้ local ดีเกินจริง: DB อยู่เครื่องเดียวกัน (network latency ~0), ข้อมูลใน DB น้อย, ไม่มี TLS, ไม่มี ALB — จดไว้ในรายงานเป็น "ข้อจำกัดของการทดสอบ"
+
+### เครื่องที่ยิง (k6) ต้องไม่เป็นคอขวด
+
+ดู CPU ของ process k6 ระหว่างยิง (Activity Monitor / `top`) ถ้า > 80% ผลใช้ไม่ได้ ลดด้วย `--discard-response-bodies` (ถ้าไม่ต้องอ่าน body) หรือลด think-time-less VUs
+
+---
+
+## 5.2 Baseline — 1 task, โหลดต่ำ
+
+```bash
+k6 run -o experimental-prometheus-rw --tag testid=baseline-1task \
+  -e TPS=1 -e DURATION=5m scripts/checkin/load.js
+```
+
+จดค่า:
+- p95 ของแต่ละ step ตอนไม่มีโหลด (ค่านี้คือ "ความเร็วดีที่สุด" ของ app)
+- CPU ต่อ 1 TPS (เช่น 1 TPS ใช้ CPU 8% ของ limit) → ใช้ประมาณ max TPS คร่าวๆ: `100% / 8% ≈ 12 TPS`
+- Memory ตอน idle และตอนมีโหลด
+
+---
+
+## 5.3 Breakpoint — หาเพดานของ 1 task
+
+`scripts/checkin/breakpoint.js`
+
+```js
+import { checkinFlow } from './flow.js';
+
+export const options = {
+  scenarios: {
+    breakpoint: {
+      executor: 'ramping-arrival-rate',
+      startRate: 1, timeUnit: '1s',
+      preAllocatedVUs: 100, maxVUs: 2000,
+      stages: [
+        // ไต่ช้าๆ ให้ app มีเวลาเข้าสู่สภาวะคงที่ที่แต่ละระดับ
+        { duration: __ENV.RAMP || '20m', target: Number(__ENV.MAX_TPS || 50) },
+      ],
+    },
+  },
+  thresholds: {
+    // หยุดเองเมื่อพังชัดเจน ไม่ต้องรอจนจบ
+    http_req_failed: [{ threshold: 'rate<0.05', abortOnFail: true, delayAbortEval: '1m' }],
+    http_req_duration: [{ threshold: 'p(95)<5000', abortOnFail: true, delayAbortEval: '1m' }],
+  },
+};
+
+export default checkinFlow;
+```
+
+ตั้ง `MAX_TPS` ประมาณ 2–3 เท่าของค่าที่ประมาณจาก baseline
+
+```bash
+k6 run -o experimental-prometheus-rw --tag testid=breakpoint-1task \
+  -e MAX_TPS=40 -e RAMP=20m scripts/checkin/breakpoint.js
+```
+
+### อ่านผลใน Grafana
+
+หาเวลา **t** แรกที่เกิดเหตุการณ์ใดเหตุการณ์หนึ่ง:
+1. p95 เกิน SLO (เช่น 800ms)
+2. error rate > 1%
+3. TPS สำเร็จ (`checkin_success`) ไม่ตามเป้าที่ยิง (เส้นแยกออกจากกัน / `dropped_iterations` เริ่มขึ้น)
+
+**Max TPS ต่อ task** = TPS สำเร็จจริงที่เวลา t (อ่านจาก panel TPS ไม่ใช่ค่าเป้า)
+พร้อมจดว่า **คอขวดคืออะไร** (CPU ชน 100%? memory? DB? connection pool?)
+
+> ทำซ้ำอย่างน้อย 2 รอบ (reset DB ทุกครั้ง) ถ้าผลต่างกัน > 10% ให้หาสาเหตุก่อน
+
+---
+
+## 5.4 ยืนยันที่ Max TPS — ยืนได้นานไหม
+
+breakpoint ไต่ขึ้นเรื่อยๆ ไม่ได้พิสูจน์ว่า app ยืนที่ระดับนั้นได้นาน ให้ยิงคงที่:
+
+```bash
+# ที่ Max TPS
+k6 run -o experimental-prometheus-rw --tag testid=confirm-max-1task \
+  -e TPS=<max> -e DURATION=15m scripts/checkin/load.js
+
+# ที่ 80% ของ Max (ค่าที่จะเสนอเป็น Safe TPS)
+k6 run -o experimental-prometheus-rw --tag testid=confirm-safe-1task \
+  -e TPS=<max*0.8> -e DURATION=15m scripts/checkin/load.js
+```
+
+ผ่านเมื่อ thresholds ใน `load.js` ผ่านครบตลอด 15 นาที ถ้าไม่ผ่าน → ลด Max TPS ลงทีละ 10% แล้วทดสอบใหม่
+
+---
+
+## 5.5 Scale เป็น 6 tasks
+
+production มี load balancer (ALB) กระจายไป 6 tasks — local ใช้ nginx แทน
+
+`docker-compose.yml`
+
+```yaml
+  app:
+    # ... เหมือน 5.1 แต่ลบ ports ออก (6 ตัว map port เดียวกันไม่ได้)
+    deploy:
+      replicas: 6
+
+  lb:
+    image: nginx:1.29
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports: ["8000:80"]
+    depends_on: [app]
+```
+
+`infra/nginx/nginx.conf`
+
+```nginx
+events { worker_connections 10240; }
+http {
+  upstream app {
+    server app:8000;   # Docker DNS คืน IP ของทั้ง 6 replicas → round robin
+    keepalive 64;
+  }
+  server {
+    listen 80;
+    location / {
+      proxy_pass http://app;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header Host $host;
+    }
+  }
+}
+```
+
+ตรวจว่ากระจายจริง: ระหว่างยิง `docker stats` ต้องเห็น app ทั้ง 6 ตัวมี CPU ใกล้ๆ กัน
+
+> - Docker Desktop ต้องมี CPU มากพอ: app 6 × 0.25 = 1.5 cores + DB + nginx + Prometheus + **k6** — แนะนำให้ Docker ≥ 6 cores
+> - DB ตอนนี้ถูก 6 tasks ใช้ร่วมกัน — ถ้า prod DB มีสเปกจำกัด ให้จำกัด `cpus`/`mem_limit` ของ DB ให้ใกล้เคียง prod ด้วย ไม่อย่างนั้นจะไม่เห็นคอขวดที่ DB
+
+รัน breakpoint อีกครั้ง โดยตั้ง `MAX_TPS` ≈ 6 × Max TPS ต่อ task × 1.5
+
+```bash
+k6 run -o experimental-prometheus-rw --tag testid=breakpoint-6task \
+  -e MAX_TPS=<...> -e RAMP=20m scripts/checkin/breakpoint.js
+```
+
+แล้วยืนยันด้วย 5.4 อีกรอบที่ระดับ 6 tasks
+
+คำนวณ **scaling efficiency** (สูตรในบทที่ 6.4) — ถ้าต่ำกว่า ~80% แปลว่ามีคอขวดที่ใช้ร่วมกัน (DB, cache, lock) ไม่ใช่ที่ app
+
+---
+
+## 5.6 Spike และ Soak (ที่ 6 tasks)
+
+**Spike** — เช่น ช่วงเปิดให้ check-in หรือ batch notification ทำให้คนเข้าพร้อมกัน
+
+```js
+// scripts/checkin/spike.js
+scenarios: {
+  spike: {
+    executor: 'ramping-arrival-rate',
+    startRate: <ปกติ>, timeUnit: '1s', preAllocatedVUs: 200, maxVUs: 3000,
+    stages: [
+      { duration: '2m',  target: <ปกติ> },
+      { duration: '30s', target: <peak × 2> },
+      { duration: '3m',  target: <peak × 2> },
+      { duration: '30s', target: <ปกติ> },
+      { duration: '3m',  target: <ปกติ> },   // ฟื้นตัวไหม
+    ],
+  },
+}
+```
+
+ดู: error ระหว่าง spike, p95 กลับมาปกติภายในกี่วินาทีหลัง spike, มี task โดน OOM kill/restart ไหม (`docker compose ps` ดู restart count)
+
+**Soak** — ยิงที่ Safe TPS นาน 1–2 ชั่วโมง ดู memory ของแต่ละ task ว่าไต่ขึ้นเรื่อยๆ ไหม (1 GB ถ้ารั่วจะโดน kill)
+
+---
+
+## ตารางผลที่ต้องได้จากบทนี้
+
+| Test | testid | Target TPS | TPS สำเร็จ | p95 (ms) | Error % | CPU/task | Mem/task | คอขวด | ผ่าน? |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Baseline 1 task | | 1 | | | | | | – | |
+| Breakpoint 1 task | | ramp | **Max =** | | | | | | |
+| Confirm max 1 task | | | | | | | | | |
+| Confirm safe 1 task | | | | | | | | | |
+| Breakpoint 6 tasks | | ramp | **Max =** | | | | | | |
+| Confirm 6 tasks | | | | | | | | | |
+| Spike 6 tasks | | | | | | | | | |
+| Soak 6 tasks | | | | | | | | | |
+
+## ✅ Checkpoint
+
+- [ ] `docker stats` ยืนยันว่า app ถูกจำกัดที่ 0.25 CPU / 1 GB
+- [ ] ได้ Max TPS ต่อ task พร้อมระบุคอขวด (ทำซ้ำ 2 รอบ ผลใกล้กัน)
+- [ ] ยืนยัน Safe TPS ต่อ task 15 นาทีผ่าน
+- [ ] ได้ Max TPS ของ 6 tasks และ scaling efficiency
+- [ ] spike / soak ไม่มี OOM หรือ restart
+- [ ] ตารางผลกรอกครบ
+
+➡️ [บทที่ 6 — การคำนวณ TPS](06-tps-calculation.md)

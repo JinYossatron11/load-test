@@ -1,1 +1,81 @@
 # load-test
+
+คู่มือฝึก Load Test ด้วย **k6 + Prometheus + Grafana** แบบลงมือทำเองตั้งแต่ต้นจนจบ
+ทุกอย่างรันบนเครื่องตัวเอง (local) ไม่ต้องยิง environment จริง
+
+> repo นี้ไม่มีโค้ดสำเร็จรูปให้ — ทุกไฟล์ (docker-compose, script k6, dashboard) **คุณเขียนเองตามคู่มือ**
+> แต่ละบทมีโจทย์ให้ทำ และมีเฉลยซ่อนไว้ใน `<details>` ไว้เปิดดูเมื่อติด
+
+---
+
+## เป้าหมายปลายทาง
+
+เมื่อทำจบทุกบท คุณต้องตอบคำถามนี้ได้ด้วยตัวเลขที่วัดมาจริง:
+
+> **"สเปก production ตอนนี้ (0.25 vCPU / 1 GB RAM × 6 tasks) รับ check-in ได้กี่ TPS?
+> และพอสำหรับ peak ที่เกิดขึ้นจริงไหม?"**
+
+ผลลัพธ์สุดท้ายคือรายงาน 1 หน้า ([บทที่ 7](docs/07-final-report.md)) ที่มี:
+
+| ตัวเลข | ความหมาย |
+| --- | --- |
+| Max TPS ต่อ 1 task | จุดที่ app 1 task ยังผ่าน SLO ได้ (p95, error rate) |
+| Safe TPS ต่อ 1 task | Max TPS หลังเผื่อ headroom |
+| TPS รวม 6 tasks | วัดจริงจาก 6 replicas + scaling efficiency |
+| Peak TPS ที่ต้องรองรับ | คำนวณจาก traffic จริงของ production |
+| คำตอบ | ไหว / ไม่ไหว / ไหวแบบเสี่ยง + ต้องเพิ่มกี่ task |
+
+---
+
+## Roadmap
+
+| # | บท | สิ่งที่จะได้ | เสร็จเมื่อ |
+| --- | --- | --- | --- |
+| 0 | [เตรียมเครื่อง](docs/00-setup.md) | k6, Docker, target ฝึกยิง (QuickPizza) | `k6 version` และเปิด QuickPizza ได้ |
+| 1 | [ยิง load test ครั้งแรก](docs/01-first-test.md) | เขียน script แรก, อ่าน end-of-test summary | อธิบายได้ว่า `http_req_duration p(95)` คืออะไร |
+| 2 | [Pattern ของ k6](docs/02-k6-patterns.md) | checks, thresholds, groups, tags, custom metrics, scenarios/executors, test types, data | เขียน smoke / load / stress / spike ได้ |
+| 3 | [Monitor ด้วย Grafana](docs/03-grafana-monitoring.md) | docker-compose: Prometheus + Grafana, ส่ง metric จาก k6, สร้าง dashboard | เห็นกราฟ VUs, RPS, p95, error rate แบบ realtime |
+| 4 | [Check-in flow ทั้ง flow](docs/04-checkin-flow.md) | ต่อ transaction flow จริง (correlation, test data, think time) | flow check-in ผ่าน smoke test 100% |
+| 5 | [Capacity test สเปก production](docs/05-capacity-test.md) | จำกัด CPU/RAM เท่า prod, หาจุดแตก 1 task, ยืนยันด้วย 6 tasks | ได้ Max TPS ต่อ task และ TPS รวม 6 tasks |
+| 6 | [การคำนวณ TPS](docs/06-tps-calculation.md) | TPS vs RPS, Little's Law, คิด VUs, คิด capacity, คิด peak demand | คำนวณ headroom ได้เอง |
+| 7 | [สรุปผล / รายงาน](docs/07-final-report.md) | template รายงาน | ตอบได้ว่า "ไหวไหม" พร้อมหลักฐาน |
+
+> แนะนำให้ทำตามลำดับ บท 1–3 ฝึกกับ QuickPizza (แอปตัวอย่างของ Grafana) ก่อน
+> แล้วบท 4–7 ค่อยเปลี่ยนมาใช้ app check-in จริง
+
+---
+
+## โครงสร้าง repo ที่คุณจะสร้างขึ้นระหว่างทำ
+
+```
+load-test/
+├── README.md
+├── docs/                         # คู่มือ (มีให้แล้ว)
+├── docker-compose.yml            # บท 3, 5  — Prometheus, Grafana, app
+├── infra/
+│   ├── prometheus/prometheus.yml
+│   ├── grafana/provisioning/...
+│   └── nginx/nginx.conf          # บท 5  — load balancer หน้า 6 tasks
+├── scripts/
+│   ├── 01-first-test.js          # บท 1
+│   ├── patterns/*.js             # บท 2
+│   └── checkin/                  # บท 4–5
+│       ├── flow.js               # ขั้นตอน check-in (ใช้ซ้ำทุก test type)
+│       ├── smoke.js
+│       ├── load.js
+│       └── breakpoint.js
+├── data/                         # test data (ไม่ commit ข้อมูลจริง)
+└── results/                      # summary JSON / screenshot (gitignore)
+```
+
+## คำศัพท์ที่ใช้บ่อย
+
+| คำ | ความหมาย |
+| --- | --- |
+| **VU** (Virtual User) | ผู้ใช้จำลอง 1 คน วนรัน function `default` ซ้ำไปเรื่อยๆ |
+| **Iteration** | การรัน function 1 รอบ = ใน repo นี้คือ check-in 1 ครั้ง |
+| **RPS** | HTTP requests ต่อวินาที |
+| **TPS** | *business transactions* ต่อวินาที (check-in สำเร็จ / วินาที) — ดู [บท 6](docs/06-tps-calculation.md) |
+| **p95** | 95% ของ request เร็วกว่าค่านี้ |
+| **SLO** | เกณฑ์ที่ยอมรับได้ เช่น p95 < 800ms และ error < 1% |
+| **Task** | 1 container ของ app (ECS task) — prod = 256 CPU units (0.25 vCPU), 1 GB |
