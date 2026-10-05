@@ -1,10 +1,18 @@
 # บทที่ 2 — Pattern ของ k6
 
+> ### 🎯 บทนี้ทำไปเพื่ออะไร
+>
+> - **เป้าหมาย:** เขียน script ที่ "เชื่อถือได้" — ตรวจผลถูก วัดแยกทีละ step ปล่อยโหลดได้ตามรูปแบบที่ต้องการ และใช้ซ้ำได้
+> - **ถ้าข้ามบทนี้:** script จะยิงได้แต่ผลไม่น่าเชื่อ: นับ request ที่ error เป็นความสำเร็จ, ไม่รู้ว่า step ไหนช้า, ใช้ executor ผิดแบบจนได้ TPS สูงเกินจริง
+> - **ผลที่ได้ไปใช้ต่อ:** ทุก pattern ในบทนี้ถูกใช้ตรงๆ ใน `scripts/checkin/` บทที่ 4–5
+
 บทนี้ฝึกกับ QuickPizza ทั้งหมด เก็บไฟล์ไว้ใน `scripts/patterns/`
 
 ---
 
 ## 2.1 Lifecycle ของ script
+
+> **ทำไปเพื่อ:** รู้ว่าโค้ดส่วนไหนถูกวัดผล (default) และส่วนไหนไม่ถูกวัด (init/setup/teardown) — การเตรียมข้อมูลต้องไม่ปนเข้ามาในตัวเลข TPS
 
 ```js
 // 1) init — รัน 1 ครั้งต่อ VU: import, อ่านไฟล์, ประกาศ metric (ยิง HTTP ไม่ได้)
@@ -28,6 +36,8 @@ export function teardown(data) { }
 
 ## 2.2 Checks — ตรวจว่า response ถูก
 
+> **ทำไปเพื่อ:** ยืนยันว่า app ทำงาน "ถูก" ไม่ใช่แค่ "ตอบกลับมา" — app ที่ตอบเร็วแต่ตอบ error ไม่ได้แปลว่ารับโหลดไหว
+
 ไม่ใช่แค่ status 200 — ต้องเช็ค **เนื้อหา** ด้วย เพราะบาง app ตอบ 200 พร้อม error message
 
 ```js
@@ -45,6 +55,8 @@ check(res, {
 ---
 
 ## 2.3 Thresholds — เกณฑ์ผ่าน/ไม่ผ่าน (SLO)
+
+> **ทำไปเพื่อ:** แปลง "ช้าแค่ไหนถึงรับไม่ได้" ให้เป็นตัวเลขชัดเจน — Max TPS ในบทที่ 5 นิยามจาก threshold เหล่านี้ และให้ k6 ตัดสินผ่าน/ไม่ผ่านให้อัตโนมัติ
 
 ```js
 export const options = {
@@ -66,6 +78,8 @@ export const options = {
 
 ## 2.4 Groups และ Tags — แยกผลทีละ step
 
+> **ทำไปเพื่อ:** เมื่อ flow ช้า ต้องรู้ว่า **step ไหน** ช้า — ไม่อย่างนั้นได้แค่รู้ว่า "ระบบช้า" แต่ไม่รู้ว่าต้องแก้ตรงไหน
+
 ```js
 import { group } from 'k6';
 
@@ -84,6 +98,8 @@ http.get(`${BASE_URL}/api/booking/${id}`, { tags: { name: 'GET /api/booking/:id'
 ---
 
 ## 2.5 Custom metrics
+
+> **ทำไปเพื่อ:** k6 นับ "request" ให้อัตโนมัติ แต่ไม่รู้ว่า "check-in สำเร็จ 1 ครั้ง" คืออะไร — ต้องนับเองเพื่อให้ได้ TPS ในความหมายของ business
 
 | ชนิด | ใช้กับ | ตัวอย่าง |
 | --- | --- | --- |
@@ -115,6 +131,8 @@ export default function () {
 ---
 
 ## 2.6 Scenarios และ Executors — รูปแบบการปล่อยโหลด
+
+> **ทำไปเพื่อ:** เลือกรูปแบบโหลดให้ตรงกับคำถาม — การหา capacity ต้องยิงที่อัตราคงที่ (open model) ไม่อย่างนั้นเมื่อ server ช้า k6 จะยิงช้าลงตามและได้ผลดีเกินจริง
 
 มี 2 แนวคิดหลัก:
 
@@ -148,7 +166,247 @@ export const options = {
 
 ---
 
-## 2.7 Test types — แต่ละแบบตอบคำถามต่างกัน
+## 2.7 ตัวอย่าง: ยิงพร้อมกัน vs ทยอยยิง
+
+> **ทำไปเพื่อ:** ผู้ใช้จริงเข้ามาได้ 2 แบบ คือ **แห่เข้ามาพร้อมกัน** (เปิดให้ check-in, ส่ง notification, หมดเวลาโปรโมชัน) กับ **ทยอยเพิ่มขึ้นเรื่อยๆ** (ช่วงเช้าที่คนค่อยๆ เข้า) — app ตัวเดียวกันรับ 2 แบบนี้ได้ไม่เท่ากัน ต้องทดสอบทั้งสองแบบ
+
+ตัวอย่างทั้งหมดใช้ request เดียวกัน ให้สร้าง module กลางไว้ก่อน — `scripts/patterns/pizza.js`
+
+```js
+import http from 'k6/http';
+import { check } from 'k6';
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:3333';
+
+export function getPizza() {
+  const res = http.post(`${BASE_URL}/api/pizza`, JSON.stringify({
+    maxCaloriesPerSlice: 1000, mustBeVegetarian: false, excludedIngredients: [],
+    excludedTools: [], maxNumberOfToppings: 5, minNumberOfToppings: 2,
+  }), {
+    headers: { Authorization: 'token abcdef0123456789' }, // token ตัวอย่างของ QuickPizza
+    tags: { name: 'get_pizza' },
+  });
+  check(res, { 'pizza 200': (r) => r.status === 200 });
+}
+```
+
+### แบบ A — ยิงพร้อมกันทีเดียว (burst)
+
+`scripts/patterns/burst-once.js` — 100 คนกดพร้อมกันในวินาทีเดียว
+
+```js
+import { getPizza } from './pizza.js';
+
+export const options = {
+  scenarios: {
+    burst: {
+      executor: 'per-vu-iterations',
+      vus: 100,        // ผู้ใช้ 100 คน
+      iterations: 1,   // คนละ 1 ครั้ง → 100 request ออกพร้อมกันทันที
+      maxDuration: '30s',
+    },
+  },
+};
+
+export default getPizza;
+```
+
+ใช้จำลอง: วินาทีที่เปิดให้ check-in หรือส่ง push notification แล้วคนกดเข้ามาพร้อมกัน
+
+### แบบ B — ยิงพร้อมกันเป็นระลอก (waves)
+
+`scripts/patterns/burst-waves.js` — 50 คนยิงพร้อมกันทุกๆ 5 วินาที
+
+```js
+import { sleep } from 'k6';
+import { getPizza } from './pizza.js';
+
+const WAVE_EVERY = 5; // ยิงพร้อมกันทุกๆ 5 วินาที
+
+export const options = {
+  scenarios: {
+    waves: { executor: 'constant-vus', vus: 50, duration: '30s' },
+  },
+};
+
+export default function () {
+  // รอจนถึงวินาทีที่หาร 5 ลงตัวของนาฬิกา → ทุก VU ตื่นพร้อมกัน
+  const now = Date.now() / 1000;
+  sleep(WAVE_EVERY - (now % WAVE_EVERY));
+  getPizza();
+}
+```
+
+ใช้จำลอง: ระบบที่มี client polling พร้อมกัน, cron/batch ที่ยิงเข้ามาตรงเวลา, หลายเครื่อง kiosk retry พร้อมกัน
+
+### แบบ C — กระโดดขึ้นฉับพลันแล้วค้างไว้ (spike)
+
+`scripts/patterns/spike.js` — จาก 5 → 150 request/s ภายใน 5 วินาที
+
+```js
+import { getPizza } from './pizza.js';
+
+export const options = {
+  scenarios: {
+    spike: {
+      executor: 'ramping-arrival-rate',
+      startRate: 5, timeUnit: '1s',
+      preAllocatedVUs: 50, maxVUs: 300,
+      stages: [
+        { duration: '20s', target: 5 },    // ปกติ 5 req/s
+        { duration: '5s',  target: 150 },  // กระโดดเป็น 150 req/s ใน 5 วินาที
+        { duration: '20s', target: 150 },  // ค้างไว้
+        { duration: '5s',  target: 5 },    // ลดกลับ
+        { duration: '20s', target: 5 },    // ดูว่าฟื้นตัวไหม
+      ],
+    },
+  },
+};
+
+export default getPizza;
+```
+
+ต่างจากแบบ A ตรงที่ไม่ได้ยิงครั้งเดียวจบ แต่ **ค้างโหลดสูงไว้** — ดูว่า app ยืนได้ไหม และหลังโหลดลดแล้ว p95 กลับมาปกติเร็วแค่ไหน
+
+### แบบ D — ทยอยเพิ่มคน (ramp-up, closed model)
+
+`scripts/patterns/ramp-vus.js` — เพิ่มคนจาก 0 → 50 ใน 1 นาที
+
+```js
+import { sleep } from 'k6';
+import { getPizza } from './pizza.js';
+
+export const options = {
+  scenarios: {
+    ramp: {
+      executor: 'ramping-vus',
+      startVUs: 0,
+      stages: [
+        { duration: '1m', target: 50 },  // ทยอยเพิ่มคนจาก 0 → 50 ใน 1 นาที
+        { duration: '2m', target: 50 },  // ค้างไว้ 50 คน
+        { duration: '30s', target: 0 },  // ทยอยออก
+      ],
+      gracefulRampDown: '10s',
+    },
+  },
+};
+
+export default function () {
+  getPizza();
+  sleep(1);
+}
+```
+
+ใช้จำลอง: จำนวนผู้ใช้ที่ค่อยๆ เพิ่มขึ้นตามช่วงเวลา และใช้ warm-up ให้ app (cache, JIT, connection pool) พร้อมก่อนวัดผล
+
+### แบบ E — ทยอยเพิ่มเป็นขั้นบันได (step load, open model)
+
+`scripts/patterns/ramp-steps.js` — เพิ่มทีละ 20 req/s แล้วค้างแต่ละขั้น 1 นาที
+
+```js
+import { getPizza } from './pizza.js';
+
+// ขั้นบันได: เพิ่มทีละ STEP req/s แล้วค้างแต่ละขั้นนาน HOLD
+const STEP = Number(__ENV.STEP || 20);
+const LEVELS = Number(__ENV.LEVELS || 5);
+const HOLD = __ENV.HOLD || '1m';
+
+const stages = [];
+for (let i = 1; i <= LEVELS; i++) {
+  stages.push({ duration: '10s', target: STEP * i }); // ขึ้นขั้น
+  stages.push({ duration: HOLD, target: STEP * i });  // ค้าง
+}
+
+export const options = {
+  scenarios: {
+    steps: {
+      executor: 'ramping-arrival-rate',
+      startRate: 0, timeUnit: '1s',
+      preAllocatedVUs: 50, maxVUs: 500,
+      stages,
+    },
+  },
+};
+
+export default getPizza;
+```
+
+```bash
+k6 run -e STEP=20 -e LEVELS=5 -e HOLD=1m scripts/patterns/ramp-steps.js
+```
+
+**แบบนี้เหมาะที่สุดสำหรับหา capacity** — แต่ละขั้นค้างไว้นานพอให้ระบบนิ่ง จึงอ่านค่าใน Grafana ได้ชัดว่า "ขั้นไหนยังผ่าน SLO ขั้นไหนเริ่มไม่ผ่าน" (ไต่ขึ้นแบบเส้นตรงยาวๆ อย่างในบทที่ 5.3 ก็ได้ แต่ขั้นบันไดอ่านง่ายกว่า)
+
+### แบบ F — หลายกลุ่มเริ่มต่างเวลา (staggered)
+
+`scripts/patterns/staggered.js` — ผสมทั้งทยอยและพร้อมกันใน test เดียว
+
+```js
+import { sleep } from 'k6';
+import { getPizza } from './pizza.js';
+
+export const options = {
+  scenarios: {
+    // กลุ่มแรก: ผู้ใช้ปกติ เริ่มทันที
+    normal_users: {
+      executor: 'constant-vus', vus: 10, duration: '2m',
+      exec: 'browse',
+    },
+    // กลุ่มที่สอง: เข้ามาทีหลัง 30 วินาที แบบทยอยเพิ่ม
+    late_comers: {
+      executor: 'ramping-vus', startTime: '30s', startVUs: 0,
+      stages: [{ duration: '30s', target: 30 }, { duration: '30s', target: 30 }],
+      exec: 'browse',
+    },
+    // กลุ่มที่สาม: แห่เข้ามาพร้อมกันที่วินาทีที่ 90
+    flash_crowd: {
+      executor: 'per-vu-iterations', startTime: '90s', vus: 100, iterations: 1,
+      exec: 'once',
+    },
+  },
+};
+
+export function browse() { getPizza(); sleep(1); }
+export function once() { getPizza(); }
+```
+
+ใช้จำลอง: วันจริงที่มีผู้ใช้ปกติอยู่แล้ว แล้วมีคลื่นคนแห่เข้ามาซ้อน — ดูว่าคนที่ใช้งานอยู่ก่อน (`normal_users`) ช้าลงไหมตอนที่ `flash_crowd` เข้ามา
+(ใน Grafana แยกดูแต่ละกลุ่มด้วย `by (scenario)`)
+
+### เปรียบเทียบ
+
+| แบบ | Executor | รูปกราฟโหลด | ตอบคำถาม |
+| --- | --- | --- | --- |
+| A ยิงพร้อมกันทีเดียว | `per-vu-iterations` | แท่งเดียวสูงๆ | คนกดพร้อมกัน N คน app ตอบทันไหม error ไหม |
+| B ระลอก | `constant-vus` + sleep ตามนาฬิกา | ฟันเลื่อย | รับแรงกระแทกซ้ำๆ ได้ไหม ระหว่างระลอกฟื้นตัวทันไหม |
+| C Spike | `ramping-arrival-rate` (ขึ้นชัน) | ขั้นกระโดด | โหลดพุ่งฉับพลันแล้วค้าง ยืนได้ไหม ฟื้นไหม |
+| D ทยอยเพิ่มคน | `ramping-vus` | ทางลาด | ผู้ใช้ N คนพร้อมกันเป็นยังไง (closed model) |
+| E ขั้นบันได | `ramping-arrival-rate` (ทีละขั้น) | บันได | **TPS สูงสุดที่ยังผ่าน SLO** (ใช้หา capacity) |
+| F หลายกลุ่ม | หลาย scenario + `startTime` | ผสม | traffic ผสมแบบวันจริง กลุ่มหนึ่งกระทบอีกกลุ่มไหม |
+
+### โจทย์ 2.7
+
+รันแบบ A และแบบ C (เปิด Grafana ไว้ถ้าทำบทที่ 3 แล้ว) แล้วเทียบ p95
+
+<details>
+<summary>ผลที่ได้จากการลองรันบน MacBook (QuickPizza ไม่จำกัด CPU)</summary>
+
+| แบบ | จำนวน request | อัตรา | p95 |
+| --- | --- | --- | --- |
+| A — 100 คนพร้อมกันทีเดียว | 100 | ~88 req/s | **1.11 s** |
+| B — 50 คนพร้อมกันทุก 5 วินาที | 350 | ~10 req/s | 187 ms |
+| C — spike ถึง 150 req/s แบบไต่ขึ้นใน 5 วินาที | 3,974 | ~57 req/s | 138 ms |
+
+ข้อสังเกต: แบบ C ยิงถึง 150 req/s แต่ p95 ยังต่ำ ส่วนแบบ A มีแค่ 100 request แต่ p95 สูงกว่าเกือบ 10 เท่า
+เพราะ request **มาถึงในเสี้ยววินาทีเดียวกัน** ต้องต่อคิวกัน (connection ใหม่ 100 เส้นพร้อมกัน, worker ไม่พอ)
+→ **ตัวเลข TPS เฉลี่ยอย่างเดียวไม่พอ** ต้องทดสอบแบบพร้อมกันด้วย ถ้า check-in มีช่วงที่คนแห่เข้ามาพร้อมกัน
+</details>
+
+---
+
+## 2.8 Test types — แต่ละแบบตอบคำถามต่างกัน
+
+> **ทำไปเพื่อ:** รู้ว่าคำถามแต่ละข้อ ("ปกติไหวไหม", "สูงสุดเท่าไร", "คนเข้าพร้อมกันไหวไหม", "รันนานแล้ว memory รั่วไหม") ต้องใช้ test แบบไหน — บทที่ 5 ใช้ครบทุกแบบ
 
 | Type | รูปโหลด | ตอบคำถาม | ระยะเวลา |
 | --- | --- | --- | --- |
@@ -193,7 +451,9 @@ scenarios: {
 
 ---
 
-## 2.8 Test data — ผู้ใช้ไม่ซ้ำกัน
+## 2.9 Test data — ผู้ใช้ไม่ซ้ำกัน
+
+> **ทำไปเพื่อ:** ระบบจริงไม่ได้มีผู้ใช้คนเดียว — ถ้าใช้ข้อมูลซ้ำ cache จะช่วยจนผลดีเกินจริง และ check-in ซ้ำ booking เดิมจะ error
 
 ใช้ `SharedArray` โหลดไฟล์ครั้งเดียวแชร์ทุก VU (ประหยัด memory)
 
@@ -219,7 +479,9 @@ CSV ใช้ `papaparse` จาก jslib: `import papaparse from 'https://jslib
 
 ---
 
-## 2.9 แยก module — flow เดียวใช้กับทุก test type
+## 2.10 แยก module — flow เดียวใช้กับทุก test type
+
+> **ทำไปเพื่อ:** เขียน flow ครั้งเดียว ใช้ได้กับ smoke/load/breakpoint/spike — เวลา flow เปลี่ยนแก้ที่เดียว และมั่นใจว่าทุก test วัด flow เดียวกัน
 
 ```
 scripts/checkin/
@@ -239,6 +501,8 @@ export default checkinFlow;
 ---
 
 ## โจทย์ 2 — QuickPizza flow ครบ
+
+> **ทำไปเพื่อ:** ฝึกรวมทุก pattern ในบทนี้บน app ที่ไม่มีความเสี่ยง — โจทย์นี้คือ "ต้นแบบ" ของ `flow.js` ในบทที่ 4
 
 เขียน `scripts/patterns/pizza-flow.js` ที่:
 
@@ -329,5 +593,6 @@ export default function () {
 - [ ] อธิบายได้ว่าทำไมหา capacity ต้องใช้ arrival-rate ไม่ใช่ ramping-vus
 - [ ] รู้ว่า `dropped_iterations` > 0 หมายความว่าอะไร
 - [ ] ดัดแปลงโจทย์ 2 เป็น smoke / stress / spike ได้ (เปลี่ยนแค่ options)
+- [ ] รันตัวอย่างยิงพร้อมกัน (A) และทยอยยิง (E) แล้วอธิบายได้ว่าทำไม p95 ต่างกัน
 
 ➡️ [บทที่ 3 — Monitor ด้วย Grafana](03-grafana-monitoring.md)

@@ -1,6 +1,10 @@
 # บทที่ 5 — Capacity test ด้วยสเปก production
 
-เป้าหมาย: หาว่า **1 task** (0.25 vCPU / 1 GB) รับ check-in ได้กี่ TPS แล้วยืนยันว่า **6 tasks** รับได้เท่าไร
+> ### 🎯 บทนี้ทำไปเพื่ออะไร
+>
+> - **เป้าหมาย:** ได้ตัวเลขจริงว่า app ที่สเปกเท่า production รับ check-in ได้กี่ TPS ต่อ task และทั้ง 6 tasks และติดคอขวดที่อะไร
+> - **ถ้าข้ามบทนี้:** ถ้ายิงบนเครื่องที่ไม่จำกัด CPU app จะได้ CPU ทั้งเครื่อง ตัวเลขจะสูงกว่า production หลายเท่า และตอบคำถาม "prod ไหวไหม" ไม่ได้
+> - **ผลที่ได้ไปใช้ต่อ:** Max TPS / Safe TPS / scaling efficiency ที่เป็น input ของสูตรในบทที่ 6
 
 ```
 แผนการทดสอบ
@@ -11,6 +15,8 @@
 ---
 
 ## 5.1 จำกัด CPU / RAM ให้เท่า production
+
+> **ทำไปเพื่อ:** จำลอง 1 ECS task บนเครื่องตัวเอง (0.25 vCPU, 1 GB) เพื่อให้ app เจอข้อจำกัดเดียวกับใน production — รวมถึงการโดน OOM kill เมื่อเกิน 1 GB
 
 Production (ECS): `cpu: 256` = **0.25 vCPU**, `memory: 1024` = **1 GB**, จำนวน **6 tasks**
 
@@ -41,6 +47,8 @@ docker stats   # คอลัมน์ CPU % ของ app ต้องไม่
 
 ### ⚠️ ข้อควรระวังเรื่องความต่างของ CPU (ต้องอ่าน)
 
+> **ทำไปเพื่อ:** รู้ว่าผลจาก local "ดีเกินจริง" ตรงไหนบ้าง จะได้ปรับตัวเลขก่อนเอาไปตอบเรื่อง production
+
 0.25 vCPU บน Mac (Apple Silicon) **เร็วกว่า** 0.25 vCPU บน AWS Fargate มาก เพราะ 1 core ของ Mac แรงกว่า 1 vCPU ของ Fargate (ซึ่งเป็นแค่ 1 hyperthread)
 → TPS ที่วัดได้บน local จะ **สูงเกินจริง** ต้องปรับด้วย **calibration factor** (วิธีคิดอยู่ใน [บทที่ 6.5](06-tps-calculation.md#65-calibration--แปลงผล-local-เป็น-production))
 
@@ -48,11 +56,15 @@ docker stats   # คอลัมน์ CPU % ของ app ต้องไม่
 
 ### เครื่องที่ยิง (k6) ต้องไม่เป็นคอขวด
 
+> **ทำไปเพื่อ:** ถ้า k6 ยิงไม่ทันเอง ตัวเลขที่ได้จะเป็นเพดานของเครื่องเรา ไม่ใช่ของ app
+
 ดู CPU ของ process k6 ระหว่างยิง (Activity Monitor / `top`) ถ้า > 80% ผลใช้ไม่ได้ ลดด้วย `--discard-response-bodies` (ถ้าไม่ต้องอ่าน body) หรือลด think-time-less VUs
 
 ---
 
 ## 5.2 Baseline — 1 task, โหลดต่ำ
+
+> **ทำไปเพื่อ:** ได้ "ความเร็วดีที่สุด" ของ app ไว้เป็นจุดอ้างอิง และได้ CPU ต่อ 1 TPS ไว้ประมาณเพดานคร่าวๆ ก่อนยิงจริง
 
 ```bash
 k6 run -o experimental-prometheus-rw --tag testid=baseline-1task \
@@ -67,6 +79,8 @@ k6 run -o experimental-prometheus-rw --tag testid=baseline-1task \
 ---
 
 ## 5.3 Breakpoint — หาเพดานของ 1 task
+
+> **ทำไปเพื่อ:** หา Max TPS ต่อ task — จุดสุดท้ายที่ยังผ่าน SLO — และระบุว่าอะไรหมดก่อน (CPU, memory, DB) เพื่อรู้ว่าต้องแก้หรือ scale ที่ไหน
 
 `scripts/checkin/breakpoint.js`
 
@@ -118,6 +132,8 @@ k6 run -o experimental-prometheus-rw --tag testid=breakpoint-1task \
 
 ## 5.4 ยืนยันที่ Max TPS — ยืนได้นานไหม
 
+> **ทำไปเพื่อ:** breakpoint ไต่ขึ้นเรื่อยๆ ไม่ได้พิสูจน์ว่าระดับนั้นยืนได้นาน (queue สะสม, GC, connection pool) — ต้องยิงคงที่ยืนยันก่อนเอาตัวเลขไปใช้
+
 breakpoint ไต่ขึ้นเรื่อยๆ ไม่ได้พิสูจน์ว่า app ยืนที่ระดับนั้นได้นาน ให้ยิงคงที่:
 
 ```bash
@@ -135,6 +151,8 @@ k6 run -o experimental-prometheus-rw --tag testid=confirm-safe-1task \
 ---
 
 ## 5.5 Scale เป็น 6 tasks
+
+> **ทำไปเพื่อ:** 6 tasks ไม่ได้รับได้ 6 เท่าเสมอ เพราะใช้ DB/cache ร่วมกัน — ต้องวัดจริงเพื่อหา scaling efficiency และดูว่าคอขวดย้ายไปอยู่ที่ไหน
 
 production มี load balancer (ALB) กระจายไป 6 tasks — local ใช้ nginx แทน
 
@@ -195,6 +213,8 @@ k6 run -o experimental-prometheus-rw --tag testid=breakpoint-6task \
 
 ## 5.6 Spike และ Soak (ที่ 6 tasks)
 
+> **ทำไปเพื่อ:** ตอบความเสี่ยงที่ breakpoint ไม่ครอบคลุม: คนเข้าพร้อมกันฉับพลันแล้วระบบล้มไหม/ฟื้นไหม และรันนานๆ แล้ว memory รั่วจนโดน kill ไหม
+
 **Spike** — เช่น ช่วงเปิดให้ check-in หรือ batch notification ทำให้คนเข้าพร้อมกัน
 
 ```js
@@ -221,6 +241,8 @@ scenarios: {
 ---
 
 ## ตารางผลที่ต้องได้จากบทนี้
+
+> **ทำไปเพื่อ:** รวมหลักฐานทุก test ไว้ที่เดียว ใช้เป็น input ของบทที่ 6 และแนบในรายงาน
 
 | Test | testid | Target TPS | TPS สำเร็จ | p95 (ms) | Error % | CPU/task | Mem/task | คอขวด | ผ่าน? |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |

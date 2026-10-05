@@ -1,10 +1,18 @@
 # บทที่ 4 — ต่อ transaction flow check-in ทั้ง flow (local)
 
+> ### 🎯 บทนี้ทำไปเพื่ออะไร
+>
+> - **เป้าหมาย:** ได้ script ที่จำลองผู้ใช้ check-in ครบทุก step เหมือนของจริง และรันซ้ำได้บนเครื่องตัวเอง
+> - **ถ้าข้ามบทนี้:** ถ้ายิงแค่ endpoint เดียว (เช่น หน้าแรก) ตัวเลขจะไม่บอกอะไรเกี่ยวกับ check-in เลย — แต่ละ step ใช้ทรัพยากรไม่เท่ากัน และ step ที่เขียน DB มักเป็นคอขวด
+> - **ผลที่ได้ไปใช้ต่อ:** `scripts/checkin/flow.js` ที่บทที่ 5 ใช้วัด capacity และนิยาม "1 transaction" ที่ใช้คิด TPS ในบทที่ 6
+
 ตั้งแต่บทนี้เปลี่ยน target จาก QuickPizza เป็น **app check-in จริง** ที่รันบนเครื่อง
 
 ---
 
 ## 4.1 รัน app check-in บน local
+
+> **ทำไปเพื่อ:** มีสภาพแวดล้อมที่ยิงได้เต็มที่โดยไม่กระทบใคร — mock ระบบภายนอกเพื่อไม่ยิงของจริง แต่ต้องใส่ delay เท่าของจริง ไม่อย่างนั้นผลจะดีเกินจริง
 
 เพิ่ม service ของ app (และ dependency ทั้งหมด เช่น DB, Redis) เข้าไปใน `docker-compose.yml`
 
@@ -30,6 +38,8 @@
 - ใช้ [WireMock](https://wiremock.org/) หรือ `mockserver` ตั้ง fixed delay ได้
 
 ## 4.2 Map flow ให้ครบก่อนเขียน script
+
+> **ทำไปเพื่อ:** script ต้องยิง request ให้เหมือน browser/app จริงทุกตัว — request ที่ตกหล่นคือโหลดที่หายไป ทำให้ TPS ที่วัดได้สูงเกินจริง
 
 เปิด browser DevTools → Network (หรือ export HAR) แล้วทำ check-in เองด้วยมือ 1 รอบ จดทุก request ที่เกิดขึ้น **รวม request ที่ frontend ยิงเบื้องหลัง** (config, polling, โหลดข้อมูลประกอบ)
 
@@ -57,7 +67,9 @@
 
 ## 4.3 เตรียม test data
 
-check-in ส่วนใหญ่ทำซ้ำไม่ได้ ถ้า breakpoint test 20 นาทีที่ 100 TPS ต้องใช้ booking ถึง ~60,000 รายการ
+> **ทำไปเพื่อ:** check-in ส่วนใหญ่ทำซ้ำไม่ได้ ถ้าข้อมูลหมดกลาง test ผลจะเต็มไปด้วย error ที่ไม่ได้มาจากโหลด และปริมาณข้อมูลใน DB ต้องใกล้ prod ไม่อย่างนั้น query จะเร็วเกินจริง
+
+ตัวอย่าง: breakpoint test 20 นาทีที่ 100 TPS ต้องใช้ booking ถึง ~60,000 รายการ
 
 ทางเลือก:
 - **seed script** สร้าง booking N รายการลง DB ก่อน test แล้ว export เป็น `data/bookings.json` (ไม่ commit ไฟล์นี้)
@@ -66,6 +78,8 @@ check-in ส่วนใหญ่ทำซ้ำไม่ได้ ถ้า bre
 - ปริมาณข้อมูลใน DB ควรใกล้ production — query ที่เร็วบน table 100 แถว อาจช้ามากบน table 10 ล้านแถว
 
 ## 4.4 เขียน `scripts/checkin/flow.js`
+
+> **ทำไปเพื่อ:** รวม pattern จากบทที่ 2 เข้ากับ flow จริง — ได้ทั้งผลแยกทีละ step (หาคอขวด) และ counter `checkin_success` (คิด TPS)
 
 โครงที่แนะนำ (เติม TODO ด้วยข้อมูลจากตาราง 4.2):
 
@@ -142,6 +156,8 @@ function step(name, fn) {
 
 ## 4.5 Smoke test — flow ต้องผ่าน 100%
 
+> **ทำไปเพื่อ:** ยืนยันว่า script ถูกก่อนเพิ่มโหลด — ถ้า 1 คนยังทำไม่ผ่าน error ตอนยิงหนักจะแยกไม่ออกว่ามาจาก script หรือจาก app รับไม่ไหว
+
 `scripts/checkin/smoke.js`
 
 ```js
@@ -167,6 +183,8 @@ k6 run -e BASE_URL=http://localhost:8000 scripts/checkin/smoke.js
 แล้วตรวจใน DB ด้วยว่า **check-in ถูกบันทึกจริง 5 รายการ** — check ใน k6 ผ่านไม่ได้แปลว่าข้อมูลถูก
 
 ## 4.6 Load test เบื้องต้น
+
+> **ทำไปเพื่อ:** ลองยิงที่ TPS ต่ำๆ คงที่ เพื่อเช็คว่าทั้งระบบ (script → app → Grafana) ทำงานครบ ก่อนเริ่มทดสอบจริงในบทที่ 5
 
 `scripts/checkin/load.js` — ยิงที่ TPS คงที่ ดู Grafana
 

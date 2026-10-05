@@ -1,5 +1,11 @@
 # บทที่ 3 — Monitor ด้วย Grafana
 
+> ### 🎯 บทนี้ทำไปเพื่ออะไร
+>
+> - **เป้าหมาย:** เห็นผลแบบ realtime ตามเวลา และเห็นทั้งฝั่งผู้ใช้ (k6) กับฝั่ง server (CPU/memory) บนกราฟเดียวกัน
+> - **ถ้าข้ามบทนี้:** จะรู้แค่ผลรวมตอนจบ แต่ไม่รู้ว่า "เริ่มพังที่กี่ TPS" และ "พังเพราะอะไร" — ซึ่งคือ 2 คำถามหลักของการหา capacity
+> - **ผลที่ได้ไปใช้ต่อ:** dashboard "Load Test — Capacity" ที่ใช้อ่าน Max TPS และคอขวดในบทที่ 5
+
 summary ตอนจบบอกแค่ภาพรวม แต่ไม่บอกว่า **"เริ่มพังตอนไหน ที่โหลดเท่าไร"** — ต้องดูเป็นกราฟตามเวลา
 
 ```
@@ -17,6 +23,8 @@ summary ตอนจบบอกแค่ภาพรวม แต่ไม่�
 ---
 
 ## 3.1 เขียน docker-compose
+
+> **ทำไปเพื่อ:** ได้ระบบ monitor ที่ทุกคนในทีมรันได้เหมือนกันด้วยคำสั่งเดียว — cAdvisor ใส่ไว้เพื่อดู CPU/memory ของ app ซึ่งเป็นตัวบอกคอขวด
 
 สร้าง `docker-compose.yml`
 
@@ -60,6 +68,8 @@ services:
 
 ## 3.2 ตั้งค่า Prometheus
 
+> **ทำไปเพื่อ:** ให้ Prometheus ดึง metric ฝั่ง server เข้ามาอยู่ที่เดียวกับ metric ของ k6 จะได้เอามาวางเทียบบนแกนเวลาเดียวกัน
+
 `infra/prometheus/prometheus.yml`
 
 ```yaml
@@ -78,6 +88,8 @@ scrape_configs:
 > k6 ไม่ต้องอยู่ใน scrape_configs เพราะ k6 **push** เข้ามาเองผ่าน `/api/v1/write`
 
 ## 3.3 ให้ Grafana รู้จัก Prometheus อัตโนมัติ (provisioning)
+
+> **ทำไปเพื่อ:** ไม่ต้องตั้งค่าผ่านหน้าเว็บทุกครั้งที่ลบ container — config อยู่ใน repo ทำซ้ำได้
 
 `infra/grafana/provisioning/datasources/prometheus.yml`
 
@@ -100,6 +112,8 @@ docker compose up -d
 - Grafana: http://localhost:3000 → Connections → Data sources ต้องเห็น Prometheus
 
 ## 3.4 ส่ง metric จาก k6
+
+> **ทำไปเพื่อ:** ส่งผลจาก k6 เข้า Prometheus ระหว่างยิง — `testid` ทำให้แยกและเทียบผลแต่ละรอบได้ (เช่น 1 task กับ 6 tasks)
 
 ```bash
 export K6_PROMETHEUS_RW_SERVER_URL=http://localhost:9090/api/v1/write
@@ -128,10 +142,14 @@ k6 run -o experimental-prometheus-rw --tag testid=pizza-$(date +%H%M) scripts/pa
 
 ## 3.5 Dashboard สำเร็จรูป
 
+> **ทำไปเพื่อ:** ได้ภาพรวมเร็วโดยไม่ต้องสร้างเอง และใช้เป็นตัวอย่างว่า dashboard ที่ดีดูอะไรบ้าง
+
 Grafana → Dashboards → New → **Import** → ใส่ ID **19665** (k6 Prometheus) → เลือก datasource Prometheus
 รัน k6 อีกรอบแล้วเลือก testid ด้านบน
 
 ## 3.6 สร้าง dashboard เอง (สำคัญ — ต้องทำ)
+
+> **ทำไปเพื่อ:** dashboard สำเร็จรูปไม่มี TPS ของ check-in และไม่มี CPU ของ app — สองค่านี้คือหัวใจของการตอบว่า "รับได้กี่ TPS และติดที่อะไร"
 
 dashboard สำเร็จรูปไม่มีกราฟ TPS ของ business และไม่มีฝั่ง server ให้สร้าง dashboard ชื่อ **"Load Test — Capacity"** เพิ่มตัวแปร `testid` (Dashboard settings → Variables → Query: `label_values(k6_vus, testid)`) แล้วสร้าง panel ตามนี้:
 
@@ -173,6 +191,8 @@ providers:
 
 ## 3.7 อ่านกราฟให้เป็น
 
+> **ทำไปเพื่อ:** แปลงกราฟเป็นข้อสรุป: ระบบยังสบาย / ถึงเพดานแล้ว / คอขวดอยู่ที่ CPU หรือที่อื่น — ทักษะที่ใช้ตรงๆ ในบทที่ 5
+
 รูปแบบที่ต้องจำได้:
 
 | สิ่งที่เห็น | แปลว่า |
@@ -187,6 +207,8 @@ providers:
 | p95 แยก step: step เดียวพุ่ง | step นั้นคือคอขวด → ไปดู query / downstream ของ step นั้น |
 
 ### โจทย์ 3
+
+> **ทำไปเพื่อ:** ซ้อมหา "จุดที่เริ่มพัง" จากกราฟจริงบน QuickPizza ก่อนทำกับ app จริง
 
 1. รันโจทย์ 2 แบบ stress (ramping-arrival-rate จาก 5 → 100 iterations/s ใน 5 นาที) โดยเปิด dashboard ค้างไว้
 2. Screenshot dashboard เก็บไว้ใน `results/`
