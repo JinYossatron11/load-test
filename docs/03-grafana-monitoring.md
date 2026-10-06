@@ -218,11 +218,128 @@ providers:
 > จากการทดลอง: ที่ 0.25 CPU โจทย์ 2 แค่ 10 iterations/s ก็ทำให้ p95 พุ่งไปหลายสิบวินาที, error ~20% และมี `dropped_iterations` จำนวนมาก
 > เป็นการซ้อมบทที่ 5 ทั้งบทกับ QuickPizza ก่อนไปทำกับ app จริง — **แนะนำมาก**
 
+## 3.8 กรณี app ตาย — รู้ได้ยังไง และดูใน Grafana ยังไง
+
+> **ทำไปเพื่อ:** ตอนหาเพดาน (บทที่ 5) app **จะ** ตายแน่นอน — ต้องแยกให้ออกว่าตายแบบไหน ตายตอนกี่ TPS และฟื้นเองได้ไหม เพราะคำตอบต่างกันมาก: "ช้าลง" ยังรับได้ แต่ "ตายแล้ว restart วนไปเรื่อยๆ" คือระบบล่มใน production
+
+### app "ตาย" มีหลายแบบ
+
+| แบบ | เกิดอะไรขึ้น | สาเหตุที่พบบ่อย |
+| --- | --- | --- |
+| **1. Crash** | process จบการทำงาน container หยุด | unhandled exception, panic |
+| **2. OOM kill** | memory เกิน limit (1 GB) → ถูก kill ทันทีแล้ว restart | memory leak, โหลดเยอะจน object ค้างใน memory, cache ไม่จำกัดขนาด |
+| **3. ค้าง (hang)** | container ยัง running แต่ **ไม่ตอบ** | thread/worker เต็ม, รอ DB connection, GC ทำงานไม่หยุด, deadlock |
+| **4. ป่วย** | ยังตอบอยู่แต่ตอบ error 5xx | DB/downstream ล้ม, timeout ภายใน |
+| **5. ตายบาง task** (6 tasks) | บาง task ตาย ที่เหลือรับต่อ | เหมือนข้อ 1–3 แต่ load balancer ตอบ 502/504 แทน |
+
+แบบ 3 อันตรายที่สุด เพราะดูจาก `docker ps` จะเห็นว่า "running" ปกติ — ต้องดูจาก metric เท่านั้น
+
+### เตรียมก่อนยิง
+
+**1. ใส่ restart policy ให้ app** — ECS จะสร้าง task ใหม่แทนตัวที่ตาย local ต้องจำลองแบบเดียวกัน ไม่อย่างนั้นตายแล้วตายเลย
+
+```yaml
+  app:
+    restart: unless-stopped
+```
+
+**2. ลด timeout ของ k6** — ค่า default คือ 60 วินาที ถ้า app ค้าง VU จะรอนานมากกว่าจะรู้ ให้ตั้งเท่ากับ timeout ของ ALB / client จริง
+
+```js
+http.get(url, { timeout: '10s' });
+```
+
+**3. เพิ่ม panel ใน dashboard "Load Test — Capacity"** (ต่อจากบท 3.6)
+
+| Panel | PromQL | ใช้ดู |
+| --- | --- | --- |
+| **App up** | `up{job="app"}` | 1 = Prometheus ดึง `/metrics` ได้, **0 = app ตายหรือค้าง** |
+| **Restarts** | `changes(process_start_time_seconds{job="app"}[1m])` | > 0 = process เริ่มใหม่ (crash / OOM) |
+| **Restarts (container)** | `changes(container_start_time_seconds{id=~"/docker/($app_ids).*"}[1m])` | ใช้แทนได้ถ้า app ไม่มี `process_start_time_seconds` |
+| **Memory เทียบ limit** | `container_memory_working_set_bytes{id=~"/docker/($app_ids).*"} / (1024*1024*1024)` | unit: percent (0-1) — ใกล้ 1.0 = ใกล้โดน OOM |
+| **Errors แยกสาเหตุ** | `sum by (status, error_code, error) (rate(k6_http_reqs_total{testid=~"$testid", expected_response="false"}[30s]))` | แยกว่า error มาจากอะไร (ตารางด้านล่าง) |
+
+> - `process_start_time_seconds` มีใน Prometheus client มาตรฐานของ Go / Java / Node / Python ถ้า app ไม่มี ให้ใช้ของ cAdvisor
+> - `container_oom_events_total` ของ cAdvisor **นับ OOM ไม่ได้** บน Docker Desktop (Mac) (ทดลองแล้วได้ 0 ตลอด) ให้ใช้ `docker events` แทน (ด้านล่าง)
+
+**4. ใส่ annotation ให้เห็นเส้นตอน restart บนทุก panel** — Dashboard settings → Annotations → New
+- Data source: Prometheus
+- Query: `changes(process_start_time_seconds{job="app"}[1m]) > 0`
+- จะได้เส้นแนวตั้งบนทุกกราฟตรงเวลาที่ app restart → เห็นทันทีว่า TPS / p95 ตอนนั้นเป็นยังไง
+
+### อ่าน error จาก k6
+
+เวลา request ไม่ได้ response กลับมา k6 จะให้ `status = 0` และใส่ `error_code` กับ `error` (ข้อความ) มาด้วย:
+
+| ที่เห็น | แปลว่า | น่าจะเป็นแบบไหน |
+| --- | --- | --- |
+| `status=0`, `error` มี `connection refused` | ไม่มีใครรอรับที่ port นั้น | **ตายแล้ว** (1, 2) หรือกำลัง start |
+| `status=0`, `error` มี `connection reset by peer` | ต่อได้แล้วโดนตัดกลางทาง | กำลังตาย / โดน kill ระหว่างตอบ |
+| `status=0`, `error` มี `request timeout` | ต่อได้แต่ไม่ตอบภายใน timeout | **ค้าง** (3) หรือช้ามาก |
+| `status=5xx` | app ตอบแต่ตอบ error | **ป่วย** (4) |
+| `status=502` / `504` (มี nginx/ALB หน้า app) | load balancer ต่อไป task ไม่ได้ / task ไม่ตอบ | **ตายบาง task** (5) |
+
+> `error_code` เป็นตัวเลขของ k6 (เช่น 1050, 1212) ความหมายดูได้จาก [k6 error codes](https://grafana.com/docs/k6/latest/javascript-api/error-codes/) — ใน panel ให้ใส่ label `error` ด้วยจะอ่านเป็นข้อความได้เลย
+
+### ยืนยันจากฝั่ง Docker
+
+```bash
+# app restart ไปกี่ครั้งแล้ว
+docker inspect <container> --format 'RestartCount={{.RestartCount}}'
+
+# ดู event การตาย/OOM ย้อนหลัง (เปิดค้างไว้ระหว่างยิงได้โดยตัด --until ออก)
+docker events --since 30m --until 0s --filter container=<container> --filter event=die --filter event=oom
+
+# log ก่อนตาย (มักมี stack trace / out of memory)
+docker compose logs --tail 100 app
+```
+
+> `docker inspect ... .State.OOMKilled` จะเป็น `false` หลัง restart แล้ว (ค่านี้ดูแค่รอบล่าสุด) — เชื่อ `docker events` กับ `RestartCount` มากกว่า
+
+### ตัวอย่างจริง: ลองทำให้ QuickPizza ตาย
+
+ทดลองบน MacBook — QuickPizza `cpus: "0.25"`, `restart: unless-stopped`, ยิง `constant-arrival-rate`, timeout 10s
+
+**ทดลอง 1 — หยุด app กลาง test** (`docker compose stop app` แล้ว 25 วินาทีต่อมา `start`) ที่ 5 req/s
+
+| เวลา | App up | k6 เห็น |
+| --- | --- | --- |
+| ก่อนหยุด | 1 | `status=200` ~5 req/s |
+| ระหว่างหยุด | **0** | `status=0`, `connection refused` ~5 req/s |
+| หลัง start | 1 | กลับมา `status=200` ทันที |
+| ผลรวม | | `http_req_failed` 28.6%, checks ผ่าน 71% |
+
+**ทดลอง 2 — memory ไม่พอ** (`mem_limit: 40m`) ยิง `/api/pizza` ที่ 60 req/s 1 นาที
+
+| ช่วง | สิ่งที่เห็นใน Grafana |
+| --- | --- |
+| 10 วินาทีแรก | Restarts ขึ้นเป็น 1, 2, 4 ภายในไม่กี่วินาที (`docker events` เห็น `oom` → `die` → `start`) error ผสม: `connection refused`, `500`, `401` |
+| หลังจากนั้น | container **running** ปกติ แต่ **App up = 0** ตลอด, memory ค้างที่ ~34/40 MB, k6 ได้ `request timeout` ~50 req/s → **ค้าง** |
+| ผลรวม | `http_req_failed` 89%, `RestartCount=4` |
+
+บทเรียนจากการทดลอง 2: app ตายแล้ว restart (แบบ 2) แล้วต่อด้วยค้าง (แบบ 3) — ถ้าดูแค่ `docker ps` จะคิดว่าปกติ
+
+### ระบุลงผลการทดสอบ
+
+เมื่อ app ตายระหว่างทดสอบ ให้จดลงตารางผล (บทที่ 5) ทุกครั้ง:
+- **ตายที่ TPS เท่าไร** (อ่านจาก panel TPS ตรงเส้น annotation)
+- **ตายแบบไหน** (1–5) และหลักฐาน (panel ไหน, `docker events`, log)
+- **ฟื้นเองได้ไหม ใช้เวลากี่วินาที** (จากจุดที่ App up = 0 จนกลับมา 1 และ error กลับเป็น 0)
+- **ตายซ้ำไหม** — ถ้า restart แล้วตายอีกเรื่อยๆ (crash loop) = ระดับโหลดนั้นทำให้ระบบล่ม ไม่ใช่แค่ช้า
+
+> **Max TPS ต้องอยู่ต่ำกว่าจุดที่ app เริ่มตาย/restart เสมอ** แม้ p95 ณ จุดนั้นยังผ่าน SLO ก็ตาม
+
+### โจทย์ 3.8
+
+ทำซ้ำการทดลองทั้ง 2 แบบด้านบนกับ QuickPizza ของตัวเอง แล้ว screenshot dashboard ที่เห็น App up, Restarts, Memory, Errors แยกสาเหตุ และ annotation พร้อมกัน
+
 ## ✅ Checkpoint
 
 - [ ] `docker compose up -d` แล้ว Prometheus target UP ครบ
 - [ ] เห็น metric k6 ใน Grafana แยกตาม testid
 - [ ] มี dashboard "Load Test — Capacity" ของตัวเอง (export JSON ไว้ใน repo)
 - [ ] อธิบายรูปแบบ saturation จากกราฟได้
+- [ ] dashboard มี panel App up, Restarts, Memory เทียบ limit, Errors แยกสาเหตุ และ annotation ตอน restart
+- [ ] แยกได้ว่า app ตายแบบไหน (crash / OOM / ค้าง / ป่วย) จาก Grafana และ `docker events`
 
 ➡️ [บทที่ 4 — Check-in flow](04-checkin-flow.md)

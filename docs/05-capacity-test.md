@@ -28,6 +28,7 @@ Production (ECS): `cpu: 256` = **0.25 vCPU**, `memory: 1024` = **1 GB**, จำ�
     cpus: "0.25"        # = 256 CPU units
     mem_limit: 1g       # = 1024 MB, เกินแล้วโดน OOM kill เหมือน ECS
     memswap_limit: 1g   # ห้ามใช้ swap (ECS Fargate ไม่มี swap)
+    restart: unless-stopped  # ตายแล้วเริ่มใหม่ เหมือน ECS แทน task ที่ตาย (ดูบท 3.8)
     environment:
       # ใช้ env / runtime config ชุดเดียวกับ production ทุกตัว
       # สำคัญ: runtime ต้องรู้ว่าตัวเองมี CPU น้อย
@@ -118,6 +119,8 @@ k6 run -o experimental-prometheus-rw --tag testid=breakpoint-1task \
 
 ### อ่านผลใน Grafana
 
+> ถ้าระหว่างไต่โหลด app ตาย / restart / ค้าง ให้ดูวิธีแยกแยะใน [บทที่ 3.8](03-grafana-monitoring.md#38-กรณี-app-ตาย--รู้ได้ยังไง-และดูใน-grafana-ยังไง) — จุดที่เริ่มตายถือเป็นจุดแตกด้วย
+
 หาเวลา **t** แรกที่เกิดเหตุการณ์ใดเหตุการณ์หนึ่ง:
 1. p95 เกิน SLO (เช่น 800ms)
 2. error rate > 1%
@@ -195,6 +198,19 @@ http {
 
 ตรวจว่ากระจายจริง: ระหว่างยิง `docker stats` ต้องเห็น app ทั้ง 6 ตัวมี CPU ใกล้ๆ กัน
 
+**ให้ Prometheus เห็น task ทุกตัวแยกกัน** — ถ้าใช้ `targets: ["app:8000"]` แบบเดิม Prometheus จะดึงแค่ตัวเดียว ให้เปลี่ยนเป็น DNS discovery ใน `infra/prometheus/prometheus.yml`:
+
+```yaml
+  - job_name: app
+    dns_sd_configs:
+      - names: ["app"]   # Docker DNS คืน IP ของทั้ง 6 replicas
+        type: A
+        port: 8000
+```
+
+จากนั้น panel **App up** จะมี 6 เส้น (แยกตาม `instance`) — ถ้าเส้นใดเป็น 0 คือ task นั้นตาย/ค้าง ส่วน k6 จะเห็นเป็น `status=502/504` จาก nginx (แบบ 5 ใน [บท 3.8](03-grafana-monitoring.md#38-กรณี-app-ตาย--รู้ได้ยังไง-และดูใน-grafana-ยังไง))
+นับจำนวน task ที่ยังรอดได้ด้วย `sum(up{job="app"})` — ใช้คู่กับกราฟ TPS ดูว่าเหลือ 5 tasks แล้ว TPS ตกไปเท่าไร (ตรงกับกรณี N-1 ในบทที่ 6.4)
+
 > - Docker Desktop ต้องมี CPU มากพอ: app 6 × 0.25 = 1.5 cores + DB + nginx + Prometheus + **k6** — แนะนำให้ Docker ≥ 6 cores
 > - DB ตอนนี้ถูก 6 tasks ใช้ร่วมกัน — ถ้า prod DB มีสเปกจำกัด ให้จำกัด `cpus`/`mem_limit` ของ DB ให้ใกล้เคียง prod ด้วย ไม่อย่างนั้นจะไม่เห็นคอขวดที่ DB
 
@@ -234,7 +250,12 @@ scenarios: {
 }
 ```
 
-ดู: error ระหว่าง spike, p95 กลับมาปกติภายในกี่วินาทีหลัง spike, มี task โดน OOM kill/restart ไหม (`docker compose ps` ดู restart count)
+ดู: error ระหว่าง spike, p95 กลับมาปกติภายในกี่วินาทีหลัง spike, มี task ตาย / restart / ค้างไหม (panel App up, Restarts, Memory และ `docker events` — วิธีอ่านอยู่ใน [บท 3.8](03-grafana-monitoring.md#38-กรณี-app-ตาย--รู้ได้ยังไง-และดูใน-grafana-ยังไง))
+
+ถ้ามี task ตายระหว่าง spike ให้ดูต่อว่า:
+- task ที่ตายตายเพราะอะไร (OOM? ค้าง?) — memory พุ่งชน 1 GB ตอน spike หรือเปล่า
+- task ที่เหลือรับโหลดต่อไหวไหม หรือ **ตายต่อกันเป็นทอดๆ** (cascading failure: ตาย 1 ตัว → โหลดไปลงที่เหลือ → ตายตาม)
+- หลัง spike จบ ทุก task กลับมา `up = 1` และ error กลับเป็น 0 ภายในกี่วินาที
 
 **Soak** — ยิงที่ Safe TPS นาน 1–2 ชั่วโมง ดู memory ของแต่ละ task ว่าไต่ขึ้นเรื่อยๆ ไหม (1 GB ถ้ารั่วจะโดน kill)
 
@@ -244,16 +265,16 @@ scenarios: {
 
 > **ทำไปเพื่อ:** รวมหลักฐานทุก test ไว้ที่เดียว ใช้เป็น input ของบทที่ 6 และแนบในรายงาน
 
-| Test | testid | Target TPS | TPS สำเร็จ | p95 (ms) | Error % | CPU/task | Mem/task | คอขวด | ผ่าน? |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Baseline 1 task | | 1 | | | | | | – | |
-| Breakpoint 1 task | | ramp | **Max =** | | | | | | |
-| Confirm max 1 task | | | | | | | | | |
-| Confirm safe 1 task | | | | | | | | | |
-| Breakpoint 6 tasks | | ramp | **Max =** | | | | | | |
-| Confirm 6 tasks | | | | | | | | | |
-| Spike 6 tasks | | | | | | | | | |
-| Soak 6 tasks | | | | | | | | | |
+| Test | testid | Target TPS | TPS สำเร็จ | p95 (ms) | Error % | CPU/task | Mem/task | ตาย/restart (กี่ครั้ง, แบบไหน, ที่กี่ TPS) | คอขวด | ผ่าน? |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Baseline 1 task | | 1 | | | | | | – | | |
+| Breakpoint 1 task | | ramp | **Max =** | | | | | | | |
+| Confirm max 1 task | | | | | | | | | | |
+| Confirm safe 1 task | | | | | | | | | | |
+| Breakpoint 6 tasks | | ramp | **Max =** | | | | | | | |
+| Confirm 6 tasks | | | | | | | | | | |
+| Spike 6 tasks | | | | | | | | | | |
+| Soak 6 tasks | | | | | | | | | | |
 
 ## ✅ Checkpoint
 

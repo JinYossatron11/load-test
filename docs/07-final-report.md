@@ -43,21 +43,29 @@
 
 ## 4. ผลการทดสอบ
 
-| Test | testid | Target TPS | TPS สำเร็จ | p95 (ms) | Error % | CPU/task | Mem/task | ผ่าน? |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Baseline 1 task | | | | | | | | |
-| Breakpoint 1 task | | | | | | | | |
-| Confirm safe 1 task | | | | | | | | |
-| Breakpoint 6 tasks | | | | | | | | |
-| Confirm 6 tasks | | | | | | | | |
-| Spike | | | | | | | | |
-| Soak | | | | | | | | |
+| Test | testid | Target TPS | TPS สำเร็จ | p95 (ms) | Error % | CPU/task | Mem/task | ตาย/restart | ผ่าน? |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Baseline 1 task | | | | | | | | | |
+| Breakpoint 1 task | | | | | | | | | |
+| Confirm safe 1 task | | | | | | | | | |
+| Breakpoint 6 tasks | | | | | | | | | |
+| Confirm 6 tasks | | | | | | | | | |
+| Spike | | | | | | | | | |
+| Soak | | | | | | | | | |
 
 <screenshot dashboard ของ breakpoint 1 task และ 6 tasks — ชี้จุดที่เริ่มพัง>
 
 ## 5. การคำนวณ
 
 <ตารางจากโจทย์บทที่ 6 พร้อมแสดงการแทนค่าในสูตร>
+
+## 5.1 เหตุการณ์ที่ app ตาย / restart / ค้าง
+
+| Test | TPS ตอนเกิด | แบบ (crash / OOM / ค้าง / 5xx / ตายบาง task) | หลักฐาน | ฟื้นเองได้ไหม (กี่วินาที) | ตายซ้ำ? |
+| --- | --- | --- | --- | --- | --- |
+| | | | | | |
+
+<screenshot dashboard ที่เห็น annotation ตอน restart + panel App up / Memory>
 
 ## 6. คอขวดที่พบ
 
