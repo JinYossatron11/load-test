@@ -319,12 +319,98 @@ docker compose logs --tail 100 app
 
 บทเรียนจากการทดลอง 2: app ตายแล้ว restart (แบบ 2) แล้วต่อด้วยค้าง (แบบ 3) — ถ้าดูแค่ `docker ps` จะคิดว่าปกติ
 
+### Timeline การตาย — ตายตอนไหน ฟื้นตอนไหน ล่มนานเท่าไร
+
+> **ทำไปเพื่อ:** "app ตาย" อย่างเดียวยังไม่พอจะตัดสินใจ ต้องตอบได้ว่า **ตายตอนกี่โมง ที่โหลดเท่าไร มีสัญญาณเตือนก่อนไหม ฟื้นตอนไหน และล่มรวมกี่วินาที** — ตัวเลขเหล่านี้ใช้ตั้ง alarm / autoscaling และใส่ในรายงานบทที่ 7
+
+#### ขั้นที่ 1 — บันทึก `docker events` ระหว่างยิง (เวลาแม่นระดับวินาที)
+
+เปิด terminal อีกอันก่อนเริ่ม k6:
+
+```bash
+docker events \
+  --filter container=<ชื่อ container ของ app> \
+  --filter event=oom --filter event=die --filter event=start \
+  | tee results/events-<testid>.log
+```
+
+กด `Ctrl+C` เมื่อ test จบ ถ้าไฟล์ว่าง แต่ Grafana บอกว่า app ล่ม = app **ค้าง** (ไม่ได้ตาย Docker จึงไม่มี event)
+
+#### ขั้นที่ 2 — เพิ่ม panel timeline ใน Grafana
+
+| Panel | ชนิด | PromQL | ตั้งค่า |
+| --- | --- | --- | --- |
+| **สถานะ app** | State timeline | `up{job="app"}` | Value mappings: `1` → `UP` (เขียว), `0` → `DOWN` (แดง) — จะเห็นแถบสีตามเวลา ชี้เมาส์เห็นเวลาเริ่ม/จบ |
+| **เวลาที่ล่มครั้งแรก** | Stat | `min_over_time(timestamp(up{job="app"} == 0)[$__range:5s]) * 1000` | Unit: Date & time → Datetime ISO |
+| **ล่มรวม (วินาที)** | Stat | `count_over_time((up{job="app"} == 0)[$__range:5s]) * 5` | Unit: seconds, No value = 0 |
+| **จำนวนครั้งที่ restart** | Stat | `changes(process_start_time_seconds{job="app"}[$__range])` | No value = 0 |
+| **TPS ที่ยิง vs TPS สำเร็จ** | Time series | A: `sum(rate(k6_iterations_total{testid=~"$testid"}[30s]))`<br>B: `sum(rate(k6_txn_success_total{testid=~"$testid"}[30s]))`<br>(app จริงใช้ `k6_checkin_success_total`) | 2 เส้นบนกราฟเดียว — เส้นแยกกัน = เริ่มรับไม่ไหว |
+
+> - `* 5` และ `:5s` มาจาก `scrape_interval: 5s` ถ้าตั้งค่าอื่นให้เปลี่ยนตาม
+> - Stat ทั้ง 3 ตัวคิดจากช่วงเวลาที่เลือกบน dashboard — ตั้ง time range ให้ครอบเฉพาะ test รอบนั้น
+> - เมื่อใช้ 6 tasks ให้ใส่ `by (instance)` จะได้ timeline แยกทีละ task
+
+#### ขั้นที่ 3 — เขียน timeline
+
+ไล่กราฟจากซ้ายไปขวา แล้วจดทุกจุดที่มีการเปลี่ยนแปลงลงตาราง:
+
+| เวลา | เหตุการณ์ | TPS ที่ยิง / สำเร็จ | ดูจาก |
+| --- | --- | --- | --- |
+| | เริ่ม test | | k6 |
+| | **สัญญาณเตือนแรก** — TPS สำเร็จเริ่มต่ำกว่า TPS ที่ยิง / p95 เริ่มพุ่ง / memory ไต่ขึ้น | | panel TPS, p95, Memory |
+| | **ล่มครั้งแรก** — App up = 0 / error เริ่มขึ้น / `die` หรือ `oom` | | panel สถานะ app, Errors, `docker events` |
+| | restart (ถ้ามี) | | `docker events` `start`, panel Restarts |
+| | **ฟื้น** — App up = 1 และ error กลับเป็น 0 | | panel สถานะ app, Errors |
+| | จบ test | | k6 |
+
+แล้วคำนวณ:
+
+| ค่า | วิธีคิด | ใช้ทำอะไร |
+| --- | --- | --- |
+| **TPS ตอนล่ม** | TPS ที่ยิง ณ เวลาล่มครั้งแรก | Max TPS ต้องต่ำกว่าค่านี้ |
+| **เวลาเตือนล่วงหน้า** | เวลาล่ม − เวลาสัญญาณเตือนแรก | ถ้าสั้นมาก alarm / autoscaling จะตอบสนองไม่ทัน |
+| **เวลาล่มแต่ละครั้ง** | เวลาฟื้น − เวลาล่ม | ผู้ใช้ใช้งานไม่ได้กี่วินาที |
+| **ล่มรวม** | ผลรวมทุกครั้ง (หรือจาก panel "ล่มรวม") | ใส่รายงาน |
+| **ฟื้นเองได้ไหม** | หลังโหลดลดลงแล้ว App up กลับเป็น 1 ไหม | ถ้าไม่ฟื้น = ต้องมีคน/ระบบ restart ให้ → ใน prod ต้องพึ่ง health check ของ ECS |
+
+#### ตัวอย่างจริง — QuickPizza ค้างแล้วไม่ฟื้น
+
+ทดลองบน MacBook: QuickPizza `cpus: "0.25"`, `mem_limit: 40m`, `restart: unless-stopped`
+ยิง `ramping-arrival-rate`: 5 req/s 30 วินาที → ไต่ไป 60 req/s ใน 30 วินาที → ค้าง 30 วินาที → ลดกลับ 5 req/s 1 นาที, timeout 10s
+
+| เวลา | เหตุการณ์ | ยิง / สำเร็จ (req/s) | ดูจาก |
+| --- | --- | --- | --- |
+| 08:15:54 | เริ่ม test | 5 / 5 | k6 |
+| 08:16:24 | เริ่มไต่โหลด | 5 / 5 | k6 |
+| 08:16:34 | ยังตามทัน | 9.3 / 9.3 | panel TPS |
+| **08:16:39** | **สัญญาณเตือนแรก** — สำเร็จต่ำกว่าที่ยิง | 17.3 / 12.3 | panel TPS (2 เส้นแยกกัน) |
+| **08:16:44** | **ล่ม** — App up = 0, error เริ่มขึ้น | ~17 / 1.3 | panel สถานะ app, Errors |
+| 08:16:54 | error ทั้งหมดเป็น `request timeout` = **ค้าง** | 19 / 0 | panel Errors |
+| 08:17:39 | โหลดสูงสุด ทุก request timeout | 57 / 0 | panel TPS |
+| 08:17:54 | ลดโหลดกลับเหลือ 5 req/s | 5 / 0 | panel TPS |
+| 08:18:34 | จบ test — **ยังไม่ฟื้น** container ยัง `Up`, `curl` ยัง timeout | 5 / 0 | panel สถานะ app, `docker ps` |
+
+`docker events`: **ว่าง** (ไม่มี `die`/`oom`) · Restarts: 0
+
+| ค่า | ผล |
+| --- | --- |
+| TPS ตอนล่ม | ~17 req/s |
+| เวลาเตือนล่วงหน้า | ~5 วินาที (08:16:39 → 08:16:44) |
+| ล่มรวม | ≥ 115 วินาที (panel "ล่มรวม") — นับถึงจบ test เท่านั้น |
+| ฟื้นเองได้ไหม | **ไม่** — แม้โหลดลดเหลือ 5 req/s แล้ว |
+
+สิ่งที่ได้จาก timeline นี้:
+- app ไม่ได้ "ตาย" แต่ **ค้าง** → `restart: unless-stopped` ช่วยไม่ได้ เพราะ Docker ไม่รู้ว่า app มีปัญหา (ใน prod ต้องมี health check ที่ทำให้ ECS เปลี่ยน task ใหม่)
+- สัญญาณเตือนมาก่อนล่มแค่ ~5 วินาที → การตั้ง alarm จาก CPU/latency เพียงอย่างเดียวจะไม่ทัน ต้องจำกัดโหลดไม่ให้ถึงจุดนี้ (Max TPS ต้องต่ำกว่า ~17 พอสมควร)
+- เทียบกับ "ทดลอง 2" ด้านบน: ตั้ง memory 40 MB เท่ากัน แต่ครั้งนั้น (ยิงคงที่ 60 req/s ทันที) โดน OOM restart 4 ครั้งก่อนค้าง → **การตายไม่ได้เกิดเหมือนเดิมทุกรอบ** ต้องทดสอบซ้ำอย่างน้อย 2 รอบ
+
 ### ระบุลงผลการทดสอบ
 
 เมื่อ app ตายระหว่างทดสอบ ให้จดลงตารางผล (บทที่ 5) ทุกครั้ง:
 - **ตายที่ TPS เท่าไร** (อ่านจาก panel TPS ตรงเส้น annotation)
 - **ตายแบบไหน** (1–5) และหลักฐาน (panel ไหน, `docker events`, log)
 - **ฟื้นเองได้ไหม ใช้เวลากี่วินาที** (จากจุดที่ App up = 0 จนกลับมา 1 และ error กลับเป็น 0)
+- **timeline** ตามตารางด้านบน แนบไฟล์ `results/events-<testid>.log` และ screenshot panel สถานะ app
 - **ตายซ้ำไหม** — ถ้า restart แล้วตายอีกเรื่อยๆ (crash loop) = ระดับโหลดนั้นทำให้ระบบล่ม ไม่ใช่แค่ช้า
 
 > **Max TPS ต้องอยู่ต่ำกว่าจุดที่ app เริ่มตาย/restart เสมอ** แม้ p95 ณ จุดนั้นยังผ่าน SLO ก็ตาม
@@ -332,6 +418,7 @@ docker compose logs --tail 100 app
 ### โจทย์ 3.8
 
 ทำซ้ำการทดลองทั้ง 2 แบบด้านบนกับ QuickPizza ของตัวเอง แล้ว screenshot dashboard ที่เห็น App up, Restarts, Memory, Errors แยกสาเหตุ และ annotation พร้อมกัน
+แล้วเขียน timeline ของตัวเอง 1 ตาราง พร้อมค่า TPS ตอนล่ม, เวลาเตือนล่วงหน้า, ล่มรวม และฟื้นเองได้ไหม
 
 ## ✅ Checkpoint
 
@@ -341,5 +428,6 @@ docker compose logs --tail 100 app
 - [ ] อธิบายรูปแบบ saturation จากกราฟได้
 - [ ] dashboard มี panel App up, Restarts, Memory เทียบ limit, Errors แยกสาเหตุ และ annotation ตอน restart
 - [ ] แยกได้ว่า app ตายแบบไหน (crash / OOM / ค้าง / ป่วย) จาก Grafana และ `docker events`
+- [ ] เขียน timeline การตายได้: ตายกี่โมง ที่ TPS เท่าไร เตือนล่วงหน้ากี่วินาที ฟื้นตอนไหน ล่มรวมกี่วินาที
 
 ➡️ [บทที่ 4 — Check-in flow](04-checkin-flow.md)

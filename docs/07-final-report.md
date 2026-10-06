@@ -65,7 +65,20 @@
 | --- | --- | --- | --- | --- | --- |
 | | | | | | |
 
-<screenshot dashboard ที่เห็น annotation ตอน restart + panel App up / Memory>
+Timeline (ทำทุก test ที่มีการล่ม — วิธีทำอยู่ในบทที่ 3.8):
+
+| เวลา | เหตุการณ์ | TPS ที่ยิง / สำเร็จ | ดูจาก |
+| --- | --- | --- | --- |
+| | เริ่ม test | | |
+| | สัญญาณเตือนแรก | | |
+| | ล่มครั้งแรก | | |
+| | ฟื้น | | |
+| | จบ test | | |
+
+สรุป: TPS ตอนล่ม __ · เตือนล่วงหน้า __ วินาที · ล่มรวม __ วินาที · ฟื้นเองได้ไหม __ · restart __ ครั้ง
+
+<screenshot dashboard ที่เห็น annotation ตอน restart + panel สถานะ app / Memory>
+<แนบ results/events-<testid>.log>
 
 ## 6. คอขวดที่พบ
 
