@@ -487,7 +487,8 @@ curl -m 5 -s -o /dev/null -w "%{http_code}\n" localhost:3333/ || echo "ไม่
 | `docker inspect ... RestartCount` | จำนวนครั้งที่ Docker เปิด container ใหม่ให้ = จำนวนครั้งที่ตาย |
 | `curl -m 5` | ลองเรียก app เองโดยรอไม่เกิน 5 วินาที — ไม่ตอบ = ยังค้างอยู่ |
 
-**ผลที่ควรเห็น**: ดูตาราง "ทดลอง 2" ด้านล่าง ถ้า app ค้างค้างไว้ ให้ `docker compose restart quickpizza` ก่อนทดลองต่อ
+**ผลที่ควรเห็น**: error ~89%, `RestartCount` หลายครั้ง (ทดลองได้ 4 และ 8), `curl` ไม่ตอบ และมี `dropped_iterations` (VU ไม่พอเพราะทุกตัวรอ timeout) — รายละเอียดดูตาราง "ทดลอง 2" ด้านล่าง
+ถ้า app ยังค้างอยู่ ให้ `docker compose restart quickpizza` ก่อนทดลองต่อ
 
 ---
 
@@ -549,7 +550,7 @@ export default function () {
 k6 run -o experimental-prometheus-rw --tag testid=death-ramp scripts/death/03-ramp-recover.js
 ```
 
-เปิด Grafana เลือก `testid = death-ramp` แล้วทำ timeline ตามหัวข้อ "Timeline การตาย" ด้านล่าง — ผลที่ได้ควรใกล้กับ "ตัวอย่างจริง — QuickPizza ค้างแล้วไม่ฟื้น"
+เปิด Grafana เลือก `testid = death-ramp` แล้วทำ timeline ตามหัวข้อ "Timeline การตาย" ด้านล่าง — ผลที่ได้ควรใกล้กับ "ตัวอย่างจริง — QuickPizza ค้างแล้วไม่ฟื้น" (รันซ้ำได้: error ~89%, `RestartCount=0`, ล่มรวม ~120 วินาที, จบ test แล้วยังค้าง)
 
 ---
 
@@ -581,7 +582,7 @@ docker compose up -d quickpizza
 | --- | --- |
 | 10 วินาทีแรก | Restarts ขึ้นเป็น 1, 2, 4 ภายในไม่กี่วินาที (`docker events` เห็น `oom` → `die` → `start`) error ผสม: `connection refused`, `500`, `401` |
 | หลังจากนั้น | container **running** ปกติ แต่ **App up = 0** ตลอด, memory ค้างที่ ~34/40 MB, k6 ได้ `request timeout` ~50 req/s → **ค้าง** |
-| ผลรวม | `http_req_failed` 89%, `RestartCount=4` |
+| ผลรวม | `http_req_failed` 89%, `RestartCount=4` (รันซ้ำอีกรอบได้ 8 — จำนวนครั้งที่ restart ไม่เท่ากันทุกรอบ แต่จบที่ค้างเหมือนกัน) |
 
 บทเรียนจากการทดลอง 2: app ตายแล้ว restart (แบบ 2) แล้วต่อด้วยค้าง (แบบ 3) — ถ้าดูแค่ `docker ps` จะคิดว่าปกติ
 
