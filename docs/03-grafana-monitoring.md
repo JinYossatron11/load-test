@@ -296,11 +296,277 @@ docker compose logs --tail 100 app
 
 > `docker inspect ... .State.OOMKilled` จะเป็น `false` หลัง restart แล้ว (ค่านี้ดูแค่รอบล่าสุด) — เชื่อ `docker events` กับ `RestartCount` มากกว่า
 
+### ลงมือทดลองเอง — script ฉบับเต็มพร้อมคำอธิบาย
+
+> **ทำไปเพื่อ:** ให้ทำการทดลองซ้ำได้เองทุกขั้นโดยไม่ต้องเดา — ทุกไฟล์มี comment อธิบายทีละบรรทัด และมีตารางสรุปว่าแต่ละส่วนทำอะไร ทำไมต้องมี
+
+ต้องทำบท 3.1–3.4 ให้เสร็จก่อน (มี `docker-compose.yml`, Prometheus, Grafana และ job `app` ใน `prometheus.yml` แล้ว)
+เก็บ script ไว้ที่ `scripts/death/`
+
+---
+
+#### ขั้นเตรียม — จำกัด CPU และเปิด restart ให้ QuickPizza
+
+แก้ service `quickpizza` ใน `docker-compose.yml`:
+
+```yaml
+  quickpizza:
+    image: ghcr.io/grafana/quickpizza-local:latest
+    ports: ["3333:3333"]
+    cpus: "0.25"              # ให้ CPU แค่ 1/4 core เท่า 1 task ของ production
+    restart: unless-stopped   # ถ้า process ตาย ให้ Docker เปิดใหม่เอง (จำลอง ECS)
+```
+
+```bash
+docker compose up -d quickpizza   # สร้าง container ใหม่ด้วยค่าที่แก้
+docker stats --no-stream          # เช็คว่าคอลัมน์ CPU % ของ quickpizza ไม่เกิน ~25%
+```
+
+| บรรทัด | ทำอะไร | ทำไมต้องมี |
+| --- | --- | --- |
+| `cpus: "0.25"` | จำกัด CPU ของ container | ถ้าไม่จำกัด app จะใช้ CPU ทั้งเครื่อง และไม่ตายง่ายๆ → ไม่เห็นสิ่งที่จะเกิดใน production |
+| `restart: unless-stopped` | Docker เปิด container ใหม่เมื่อ process ตาย (ยกเว้นเราสั่ง stop เอง) | ถ้าไม่มี app ตายแล้วตายเลย จะไม่เห็นการ restart / การฟื้น |
+| `docker compose up -d quickpizza` | สร้าง container ใหม่ตาม config ล่าสุด | แก้ yaml แล้วต้องสั่งนี้ ค่าใหม่ถึงมีผล |
+
+---
+
+#### ทดลอง 1 — หยุด app กลาง test (ตายแล้วฟื้น)
+
+`scripts/death/01-stop-start.js`
+
+```js
+import http from 'k6/http';      // module สำหรับยิง HTTP
+import { check } from 'k6';       // ใช้ตรวจว่า response ถูกไหม
+
+export const options = {
+  scenarios: {
+    steady: {                                // ชื่อ scenario (ตั้งอะไรก็ได้ จะไปโผล่เป็น tag scenario)
+      executor: 'constant-arrival-rate',     // ยิงที่อัตราคงที่ ไม่สนว่า app จะช้าหรือตาย
+      rate: 5,                               // 5 ครั้ง...
+      timeUnit: '1s',                        // ...ต่อวินาที = 5 req/s
+      duration: '90s',                       // ยิงนาน 90 วินาที
+      preAllocatedVUs: 20,                   // เตรียม VU ไว้ 20 ตัวตั้งแต่เริ่ม
+      maxVUs: 200,                           // ถ้า app ค้าง VU จะไม่ว่าง k6 เพิ่ม VU ได้ถึง 200
+    },
+  },
+};
+
+export default function () {
+  const res = http.get('http://localhost:3333/', {
+    timeout: '10s',          // รอ response ไม่เกิน 10 วินาที (ค่าปกติ 60s นานเกินไป)
+    tags: { name: 'home' },  // ตั้งชื่อ request ไว้แยกใน Grafana
+  });
+  check(res, { 'status 200': (r) => r.status === 200 }); // นับว่าสำเร็จเมื่อได้ 200 เท่านั้น
+}
+```
+
+| ส่วน | ทำไมต้องเป็นแบบนี้ |
+| --- | --- |
+| `constant-arrival-rate` | ถ้าใช้ `vus: 5` แบบปกติ ตอน app ตาย VU จะรอ timeout แล้วยิงช้าลงเอง → จำนวน error ที่เห็นจะน้อยกว่าความจริง แบบ arrival-rate ยิง 5 ครั้ง/วินาทีเสมอ เหมือนผู้ใช้จริงที่ไม่รู้ว่า app ตาย |
+| `maxVUs: 200` | ตอน app ค้าง แต่ละ request ค้างนาน 10s → ต้องใช้ VU ~5 × 10 = 50 ตัวถึงจะยิงได้ครบ 5/วินาที (Little's Law บท 1.0) |
+| `timeout: '10s'` | ให้รู้เร็วว่า app ไม่ตอบ — ตั้งใกล้กับ timeout ของ load balancer / client จริง |
+| `check(... === 200)` | ทำให้ `checks` ใน summary บอก % ที่ผู้ใช้ใช้งานได้จริง |
+
+**รัน** — เปิด 3 terminal:
+
+```bash
+# Terminal 1 — บันทึกเหตุการณ์ของ container ลงไฟล์ (เวลาแม่นระดับวินาที)
+mkdir -p results
+docker events \
+  --filter container=$(docker compose ps -q quickpizza) \
+  --filter event=die --filter event=oom --filter event=start --filter event=stop \
+  | tee results/events-stop-start.log
+```
+
+```bash
+# Terminal 2 — เริ่มยิง และส่ง metric เข้า Prometheus
+export K6_PROMETHEUS_RW_SERVER_URL=http://localhost:9090/api/v1/write
+export K6_PROMETHEUS_RW_TREND_STATS="p(95),p(99),avg,max"
+k6 run -o experimental-prometheus-rw --tag testid=death-stop-start scripts/death/01-stop-start.js
+```
+
+```bash
+# Terminal 3 — สั่งทันทีหลังเริ่ม k6: รอ 25 วิ → หยุด app → รอ 25 วิ → เปิดใหม่
+sleep 25 && docker compose stop quickpizza && date && \
+sleep 25 && docker compose start quickpizza && date
+```
+
+| คำสั่ง | ทำอะไร | ทำไม |
+| --- | --- | --- |
+| `docker compose ps -q quickpizza` | ได้ container id ของ quickpizza | `docker events` ต้องรู้ว่าจะดู container ไหน |
+| `--filter event=die/oom/start/stop` | เอาเฉพาะเหตุการณ์ที่เกี่ยวกับการตาย/เกิดใหม่ | ไม่อย่างนั้นจะมี event อื่นปนเยอะ |
+| `tee results/...log` | แสดงบนจอและเขียนลงไฟล์พร้อมกัน | เก็บไว้ทำ timeline / แนบรายงาน |
+| `K6_PROMETHEUS_RW_SERVER_URL` | บอก k6 ว่าจะส่ง metric ไปที่ไหน | ให้เห็นผลใน Grafana |
+| `-o experimental-prometheus-rw` | เปิดการส่ง metric ไป Prometheus | ไม่ใส่ = เห็นแค่ summary ตอนจบ |
+| `--tag testid=...` | ติดป้ายให้ทุก metric ของรอบนี้ | เลือกดูเฉพาะรอบนี้ใน Grafana |
+| `docker compose stop` | หยุด app (เหมือน crash) | `restart: unless-stopped` จะ **ไม่** เปิดให้เพราะเราสั่ง stop เอง → คุมเวลาตายได้ |
+| `date` | พิมพ์เวลาตอนหยุด/เปิด | ไว้เทียบกับกราฟใน Grafana |
+
+**ผลที่ควรเห็น**: ดูตาราง "ทดลอง 1" ในหัวข้อตัวอย่างจริงด้านล่าง
+
+---
+
+#### ทดลอง 2 — memory ไม่พอ (OOM → restart → ค้าง)
+
+**เตรียม** — ลด memory ของ quickpizza ให้เหลือ 40 MB (ปกติใช้ ~35 MB จึงแทบไม่เหลือที่ว่าง):
+
+```yaml
+  quickpizza:
+    image: ghcr.io/grafana/quickpizza-local:latest
+    ports: ["3333:3333"]
+    cpus: "0.25"
+    mem_limit: 40m            # memory สูงสุด 40 MB เกินแล้วโดน kill (OOM)
+    memswap_limit: 40m        # ห้ามใช้ swap (เท่ากับ mem_limit = swap 0) เหมือน Fargate
+    restart: unless-stopped
+```
+
+```bash
+docker compose up -d quickpizza
+```
+
+> ใน production ค่านี้คือ 1 GB — ที่ใช้ 40 MB เพื่อให้เห็น OOM เร็วๆ ในการซ้อมเท่านั้น **ทำเสร็จแล้วอย่าลืมเอา 2 บรรทัดนี้ออก**
+
+`scripts/death/02-oom.js`
+
+```js
+import http from 'k6/http';
+import { check } from 'k6';
+
+export const options = {
+  scenarios: {
+    heavy: {
+      executor: 'constant-arrival-rate',
+      rate: 60,                // 60 req/s ตั้งแต่วินาทีแรก — สูงพอให้ memory พุ่ง
+      timeUnit: '1s',
+      duration: '60s',
+      preAllocatedVUs: 100,
+      maxVUs: 500,             // app ค้าง 10s × 60 req/s ≈ 600 VU — 500 จึงพอให้เห็นอาการ (จะมี dropped_iterations บ้าง)
+    },
+  },
+};
+
+// body ของ request ขอพิซซ่า — endpoint นี้ทำงานหนักกว่าหน้าแรก (สุ่มส่วนผสม, คำนวณแคลอรี่)
+const body = JSON.stringify({
+  maxCaloriesPerSlice: 1000,
+  mustBeVegetarian: false,
+  excludedIngredients: [],
+  excludedTools: [],
+  maxNumberOfToppings: 5,
+  minNumberOfToppings: 2,
+});
+
+export default function () {
+  const res = http.post('http://localhost:3333/api/pizza', body, {
+    headers: { Authorization: 'token abcdef0123456789' }, // token ตัวอย่างที่ QuickPizza ยอมรับ
+    timeout: '10s',
+    tags: { name: 'get_pizza' },
+  });
+  check(res, { 'status 200': (r) => r.status === 200 });
+}
+```
+
+| ส่วน | ทำไมต้องเป็นแบบนี้ |
+| --- | --- |
+| `rate: 60` ตั้งแต่เริ่ม | กระแทกทีเดียวให้ memory พุ่งเกิน 40 MB เร็วๆ |
+| `/api/pizza` แทน `/` | หน้าแรกเบาเกินไป ไม่ทำให้ memory ขึ้น |
+| `body` อยู่นอก function | สร้าง JSON ครั้งเดียวต่อ VU ไม่ต้องสร้างใหม่ทุก request (ไม่ให้ k6 กิน CPU เอง) |
+| `Authorization` | `/api/pizza` ต้องมี token ไม่อย่างนั้นได้ 401 |
+
+**รัน** — Terminal 1 รัน `docker events` เหมือนทดลอง 1 (เปลี่ยนชื่อไฟล์เป็น `events-oom.log`) แล้ว:
+
+```bash
+k6 run -o experimental-prometheus-rw --tag testid=death-oom scripts/death/02-oom.js
+
+# หลังจบ ดูว่า restart ไปกี่ครั้ง และ app ยังตอบไหม
+docker inspect $(docker compose ps -q quickpizza) --format 'RestartCount={{.RestartCount}}'
+curl -m 5 -s -o /dev/null -w "%{http_code}\n" localhost:3333/ || echo "ไม่ตอบ (ค้าง)"
+```
+
+| คำสั่ง | ทำอะไร |
+| --- | --- |
+| `docker inspect ... RestartCount` | จำนวนครั้งที่ Docker เปิด container ใหม่ให้ = จำนวนครั้งที่ตาย |
+| `curl -m 5` | ลองเรียก app เองโดยรอไม่เกิน 5 วินาที — ไม่ตอบ = ยังค้างอยู่ |
+
+**ผลที่ควรเห็น**: ดูตาราง "ทดลอง 2" ด้านล่าง ถ้า app ค้างค้างไว้ ให้ `docker compose restart quickpizza` ก่อนทดลองต่อ
+
+---
+
+#### ทดลอง 3 — ไต่โหลดหาจุดตาย แล้วลดโหลดดูการฟื้น (ใช้ทำ timeline)
+
+ใช้ config memory 40 MB เดิมจากทดลอง 2 (`docker compose restart quickpizza` ให้เริ่มสะอาดก่อน)
+
+`scripts/death/03-ramp-recover.js`
+
+```js
+import http from 'k6/http';
+import { check } from 'k6';
+
+export const options = {
+  scenarios: {
+    ramp: {
+      executor: 'ramping-arrival-rate',  // ยิงตามอัตราที่เปลี่ยนไปตาม stages
+      startRate: 5,                       // เริ่มที่ 5 req/s
+      timeUnit: '1s',
+      preAllocatedVUs: 100,
+      maxVUs: 600,
+      stages: [
+        { duration: '30s', target: 5 },   // 0:00–0:30 ปกติ 5 req/s → ได้ค่า "ตอนยังดี" ไว้เทียบ
+        { duration: '30s', target: 60 },  // 0:30–1:00 ไต่ขึ้นไป 60 req/s → หาจุดที่เริ่มพัง
+        { duration: '30s', target: 60 },  // 1:00–1:30 ค้างที่ 60 → ดูว่าพังแบบไหน
+        { duration: '10s', target: 5 },   // 1:30–1:40 ลดกลับ 5 req/s
+        { duration: '50s', target: 5 },   // 1:40–2:30 ค้างที่ 5 → ดูว่าฟื้นเองได้ไหม
+      ],
+    },
+  },
+};
+
+const body = JSON.stringify({
+  maxCaloriesPerSlice: 1000, mustBeVegetarian: false, excludedIngredients: [],
+  excludedTools: [], maxNumberOfToppings: 5, minNumberOfToppings: 2,
+});
+
+export default function () {
+  const res = http.post('http://localhost:3333/api/pizza', body, {
+    headers: { Authorization: 'token abcdef0123456789' },
+    timeout: '10s',
+    tags: { name: 'get_pizza' },
+  });
+  check(res, { 'status 200': (r) => r.status === 200 });
+}
+```
+
+| ส่วน | ทำไมต้องเป็นแบบนี้ |
+| --- | --- |
+| `ramping-arrival-rate` | ไต่โหลดขึ้นทีละนิด → อ่านได้ว่า "เริ่มพังที่กี่ req/s" (ทดลอง 2 กระแทกทีเดียวจึงบอกไม่ได้) |
+| stage แรกค้างที่ 5 | ได้ช่วงที่ทุกอย่างปกติไว้เป็นจุดอ้างอิงบนกราฟ |
+| ค้างที่ 60 | ดูอาการหลังพัง: restart วน? ค้าง? 5xx? |
+| 2 stage สุดท้ายลดกลับ 5 | **คำถามสำคัญ: ลดโหลดแล้ว app ฟื้นเองไหม** — ถ้าไม่ฟื้น ใน production ต้องพึ่ง health check ให้เปลี่ยน task |
+| ไม่ใส่ `abortOnFail` | ต้องการให้ยิงต่อจนจบแม้ app พัง ไม่อย่างนั้นจะไม่เห็นช่วงฟื้นตัว |
+
+**รัน** — `docker events` → `events-ramp.log` แล้ว:
+
+```bash
+k6 run -o experimental-prometheus-rw --tag testid=death-ramp scripts/death/03-ramp-recover.js
+```
+
+เปิด Grafana เลือก `testid = death-ramp` แล้วทำ timeline ตามหัวข้อ "Timeline การตาย" ด้านล่าง — ผลที่ได้ควรใกล้กับ "ตัวอย่างจริง — QuickPizza ค้างแล้วไม่ฟื้น"
+
+---
+
+#### เก็บกวาดหลังทดลอง
+
+```bash
+# เอา mem_limit / memswap_limit ออกจาก docker-compose.yml แล้ว
+docker compose up -d quickpizza
+```
+
+---
+
 ### ตัวอย่างจริง: ลองทำให้ QuickPizza ตาย
 
 ทดลองบน MacBook — QuickPizza `cpus: "0.25"`, `restart: unless-stopped`, ยิง `constant-arrival-rate`, timeout 10s
 
-**ทดลอง 1 — หยุด app กลาง test** (`docker compose stop app` แล้ว 25 วินาทีต่อมา `start`) ที่ 5 req/s
+**ทดลอง 1 — หยุด app กลาง test** (`docker compose stop quickpizza` แล้ว 25 วินาทีต่อมา `start`) ที่ 5 req/s
 
 | เวลา | App up | k6 เห็น |
 | --- | --- | --- |
@@ -417,7 +683,7 @@ docker events \
 
 ### โจทย์ 3.8
 
-ทำซ้ำการทดลองทั้ง 2 แบบด้านบนกับ QuickPizza ของตัวเอง แล้ว screenshot dashboard ที่เห็น App up, Restarts, Memory, Errors แยกสาเหตุ และ annotation พร้อมกัน
+ทำการทดลองทั้ง 3 แบบด้านบน (script อยู่ในหัวข้อ "ลงมือทดลองเอง") กับ QuickPizza ของตัวเอง แล้ว screenshot dashboard ที่เห็น App up, Restarts, Memory, Errors แยกสาเหตุ และ annotation พร้อมกัน
 แล้วเขียน timeline ของตัวเอง 1 ตาราง พร้อมค่า TPS ตอนล่ม, เวลาเตือนล่วงหน้า, ล่มรวม และฟื้นเองได้ไหม
 
 ## ✅ Checkpoint
